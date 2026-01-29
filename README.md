@@ -42,6 +42,7 @@ print(response["hits"]["hits"][0]["_source"])
 | **ES-Compatible API** | Same method signatures as `elasticsearch-py` |
 | **FTS5 Full-Text Search** | Porter stemming, BM25 ranking |
 | **Hybrid Search** | Combine keyword + semantic search with RRF |
+| **Chunking + inner_hits** | Long docs split into passages, matching chunks returned |
 | **Bolt-On for Existing Tables** | Add search to any SQLite table without schema changes |
 | **Zero Config** | No server, no setup, just `pip install` |
 | **Embedding Backends** | Voyage AI, Google Gemini, OpenAI |
@@ -159,6 +160,8 @@ es.register_table(
     id_column="id",                  # Primary key
     text_columns=["title", "body"],  # Columns to index
     embedding_backend="voyage",      # Optional: for semantic search
+    chunk_size=250,                  # Words per chunk (ES default)
+    chunk_overlap=100,               # Overlap between chunks (ES default)
 )
 
 # Build the index
@@ -167,15 +170,29 @@ es.indices.reindex("articles")
 # Search with ES API
 response = es.search(index="articles", q="machine learning", mode="hybrid")
 
-# Results contain your row IDs
+# Results contain row IDs and matching chunks (inner_hits)
 for hit in response["hits"]["hits"]:
     row_id = hit["_id"]  # Join back to your table
+
+    # inner_hits shows which chunks matched (for semantic/hybrid)
+    if "inner_hits" in hit:
+        for chunk in hit["inner_hits"]["chunks"]:
+            print(f"  Matched: {chunk['text'][:50]}... (score: {chunk['_score']})")
 ```
 
 **How it works:**
 - Creates FTS5 content table pointing at your table (no data duplication)
-- Auto-syncs via triggers on INSERT/UPDATE/DELETE
+- Auto-syncs FTS5 via triggers on INSERT/UPDATE/DELETE
+- Long text is chunked (250 words, 100 overlap - matching ES `semantic_text`)
+- Each chunk is embedded separately for precise semantic matching
+- Search returns documents with `inner_hits` showing matching passages
 - Registrations persist across reconnections
+
+**Chunking (mirrors Elasticsearch `semantic_text`):**
+- Documents are split into 250-word chunks with 100-word overlap
+- Semantic search finds the best matching chunks
+- Results include `inner_hits` with the matching passages
+- This lets you pinpoint which section of a long document matched
 
 **Reconnecting later:**
 ```python
