@@ -261,5 +261,5 @@ def parallel_bulk(
         client,
         actions,
         chunk_size=chunk_size,
-        raise_on_error=raise_on_error,
+        raise_on_exception=raise_on_error,
     )
