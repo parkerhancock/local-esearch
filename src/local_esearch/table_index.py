@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from local_esearch.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, chunk_text
 from local_esearch.hybrid import reciprocal_rank_fusion
 
 if TYPE_CHECKING:
@@ -23,12 +25,16 @@ class TableConfig:
     text_columns: list[str]
     embedding_text: Callable[[dict], str] | str | None = None
     embedding_backend: EmbeddingBackend | None = None
+    chunk_size: int = DEFAULT_CHUNK_SIZE  # 250 words (ES default)
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP  # 100 words (ES default)
     fts_table: str = field(default="")
     vec_table: str = field(default="")
+    chunks_table: str = field(default="")
 
     def __post_init__(self):
         self.fts_table = f"{self.table}_fts"
         self.vec_table = f"{self.table}_vec"
+        self.chunks_table = f"{self.table}_chunks"
 
 
 class TableIndex:
@@ -59,6 +65,8 @@ class TableIndex:
         text_columns: list[str] | None = None,
         embedding_text: Callable[[dict], str] | str | None = None,
         embedding_backend: EmbeddingBackend | None = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ):
         """Initialize table index.
 
@@ -72,6 +80,8 @@ class TableIndex:
                 - Callable: function(row_dict) -> str
                 - None: concatenate all text_columns
             embedding_backend: Embedding backend for vector search
+            chunk_size: Words per chunk for embeddings (default: 250, matching ES)
+            chunk_overlap: Overlap words between chunks (default: 100, matching ES)
         """
         self._conn = conn
         self.config = TableConfig(
@@ -80,6 +90,8 @@ class TableIndex:
             text_columns=text_columns or [],
             embedding_text=embedding_text,
             embedding_backend=embedding_backend,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
         )
         self._has_vec = self._check_vec_available()
 
@@ -100,6 +112,7 @@ class TableIndex:
         self._create_fts_triggers()
         if self.config.embedding_backend and self._has_vec:
             self._create_vec_table()
+            self._create_chunks_table()
 
     def _create_fts_table(self) -> None:
         """Create FTS5 virtual table pointing at the source table."""
@@ -155,18 +168,38 @@ class TableIndex:
         self._conn.commit()
 
     def _create_vec_table(self) -> None:
-        """Create vector table for embeddings."""
+        """Create vector table for chunk embeddings."""
         if not self.config.embedding_backend:
             return
 
         dims = self.config.embedding_backend.dimensions
+        # Use chunk_id as primary key: "rowid:chunk_idx"
         sql = f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS {self.config.vec_table} USING vec0(
-                row_id INTEGER PRIMARY KEY,
+                chunk_id TEXT PRIMARY KEY,
                 embedding float[{dims}]
             )
         """
         self._conn.execute(sql)
+        self._conn.commit()
+
+    def _create_chunks_table(self) -> None:
+        """Create metadata table for chunks (stores text for inner_hits)."""
+        sql = f"""
+            CREATE TABLE IF NOT EXISTS {self.config.chunks_table} (
+                chunk_id TEXT PRIMARY KEY,
+                row_id INTEGER NOT NULL,
+                chunk_idx INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                start_char INTEGER,
+                end_char INTEGER
+            )
+        """
+        self._conn.execute(sql)
+        self._conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.config.chunks_table}_row "
+            f"ON {self.config.chunks_table}(row_id)"
+        )
         self._conn.commit()
 
     def reindex(
@@ -220,42 +253,46 @@ class TableIndex:
         batch_size: int,
         progress_callback: Callable[[int, int], None] | None,
     ) -> int:
-        """Rebuild vector embeddings."""
+        """Rebuild vector embeddings with chunking.
+
+        Chunks each document's text and embeds each chunk separately.
+        Stores chunk metadata for inner_hits retrieval.
+        """
         backend = self.config.embedding_backend
         if not backend:
             return 0
 
         table = self.config.table
         vec_table = self.config.vec_table
+        chunks_table = self.config.chunks_table
         id_col = self.config.id_column
 
         # Get rows to process
         if only_missing:
+            # Find rows that have no chunks in the vec table
             sql = f"""
                 SELECT t.* FROM {table} t
-                LEFT JOIN {vec_table} v ON t.{id_col} = v.row_id
-                WHERE v.row_id IS NULL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {chunks_table} c WHERE c.row_id = t.{id_col}
+                )
             """
         else:
-            # Clear existing vectors
+            # Clear existing vectors and chunks
             self._conn.execute(f"DELETE FROM {vec_table}")
+            self._conn.execute(f"DELETE FROM {chunks_table}")
             sql = f"SELECT * FROM {table}"
 
         cursor = self._conn.execute(sql)
         columns = [desc[0] for desc in cursor.description]
-
-        # Process in batches
-        indexed = 0
-        batch = []
-        batch_ids = []
 
         # Get total for progress
         if progress_callback:
             if only_missing:
                 total_cursor = self._conn.execute(f"""
                     SELECT COUNT(*) FROM {table} t
-                    LEFT JOIN {vec_table} v ON t.{id_col} = v.row_id
-                    WHERE v.row_id IS NULL
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {chunks_table} c WHERE c.row_id = t.{id_col}
+                    )
                 """)
             else:
                 total_cursor = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
@@ -263,31 +300,75 @@ class TableIndex:
         else:
             total = 0
 
+        # Collect chunks for batch embedding
+        chunk_texts = []
+        chunk_metadata = []  # (chunk_id, row_id, chunk_idx, text, start, end)
+        rows_processed = 0
+
         for row in cursor:
             row_dict = dict(zip(columns, row, strict=True))
             row_id = row_dict[id_col]
             text = self._get_embedding_text(row_dict)
 
-            batch.append(text)
-            batch_ids.append(row_id)
+            # Chunk the text
+            chunks = chunk_text(
+                text,
+                chunk_size=self.config.chunk_size,
+                chunk_overlap=self.config.chunk_overlap,
+            )
 
-            if len(batch) >= batch_size:
-                self._embed_batch(batch, batch_ids)
-                indexed += len(batch)
-                if progress_callback:
-                    progress_callback(indexed, total)
-                batch = []
-                batch_ids = []
+            for chunk in chunks:
+                chunk_id = f"{row_id}:{chunk.index}"
+                chunk_texts.append(chunk.text)
+                chunk_metadata.append(
+                    (chunk_id, row_id, chunk.index, chunk.text, chunk.start_char, chunk.end_char)
+                )
+
+            # Embed in batches
+            if len(chunk_texts) >= batch_size:
+                self._embed_chunks(chunk_texts, chunk_metadata)
+                chunk_texts = []
+                chunk_metadata = []
+
+            rows_processed += 1
+            if progress_callback:
+                progress_callback(rows_processed, total)
 
         # Final batch
-        if batch:
-            self._embed_batch(batch, batch_ids)
-            indexed += len(batch)
-            if progress_callback:
-                progress_callback(indexed, total)
+        if chunk_texts:
+            self._embed_chunks(chunk_texts, chunk_metadata)
 
         self._conn.commit()
-        return indexed
+        return rows_processed
+
+    def _embed_chunks(
+        self, texts: list[str], metadata: list[tuple[str, int, int, str, int, int]]
+    ) -> None:
+        """Embed a batch of chunks and store in vec + chunks tables."""
+        backend = self.config.embedding_backend
+        if not backend or not texts:
+            return
+
+        embeddings = backend.embed_batch(texts)
+        vec_table = self.config.vec_table
+        chunks_table = self.config.chunks_table
+
+        for embedding, meta in zip(embeddings, metadata, strict=True):
+            chunk_id, row_id, chunk_idx, chunk_text_str, start_char, end_char = meta
+
+            # Store embedding
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {vec_table} (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, json.dumps(embedding)),
+            )
+
+            # Store chunk metadata
+            self._conn.execute(
+                f"""INSERT OR REPLACE INTO {chunks_table}
+                    (chunk_id, row_id, chunk_idx, chunk_text, start_char, end_char)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                (chunk_id, row_id, chunk_idx, chunk_text_str, start_char, end_char),
+            )
 
     def _get_embedding_text(self, row: dict) -> str:
         """Extract text to embed from a row."""
@@ -301,21 +382,6 @@ class TableIndex:
             # It's a column name
             return str(row.get(self.config.embedding_text, ""))
 
-    def _embed_batch(self, texts: list[str], row_ids: list[int]) -> None:
-        """Embed a batch of texts and store in vector table."""
-        backend = self.config.embedding_backend
-        if not backend:
-            return
-
-        embeddings = backend.embed_batch(texts)
-        vec_table = self.config.vec_table
-
-        for row_id, embedding in zip(row_ids, embeddings, strict=True):
-            self._conn.execute(
-                f"INSERT OR REPLACE INTO {vec_table} (row_id, embedding) VALUES (?, ?)",
-                (row_id, json.dumps(embedding)),
-            )
-
     def search(
         self,
         query: str,
@@ -324,6 +390,7 @@ class TableIndex:
         limit: int = 10,
         offset: int = 0,
         backfill_vectors: bool = True,
+        inner_hits_size: int = 3,
     ) -> list[dict[str, Any]]:
         """Search the index.
 
@@ -333,9 +400,11 @@ class TableIndex:
             limit: Maximum results
             offset: Pagination offset
             backfill_vectors: Auto-embed rows missing vectors (for hybrid/semantic)
+            inner_hits_size: Max chunks to return per document in inner_hits
 
         Returns:
-            List of dicts with 'id' and 'score' keys
+            List of dicts with 'id', 'score', and optional 'inner_hits' keys.
+            inner_hits contains matching chunks for semantic/hybrid modes.
         """
         # Backfill missing vectors if needed
         if backfill_vectors and mode in ("semantic", "hybrid"):
@@ -344,27 +413,35 @@ class TableIndex:
 
         keyword_results = []
         vector_results = []
+        inner_hits_map: dict[Any, list[dict]] = {}
 
         if mode in ("keyword", "hybrid"):
             keyword_results = self._keyword_search(query, limit=limit + offset)
 
         if mode in ("semantic", "hybrid"):
             if self.config.embedding_backend and self._has_vec:
-                vector_results = self._vector_search(query, limit=limit + offset)
+                vector_results, inner_hits_map = self._vector_search(
+                    query, limit=limit + offset, inner_hits_size=inner_hits_size
+                )
 
         # Combine results
         if mode == "hybrid" and keyword_results and vector_results:
             fused = reciprocal_rank_fusion(keyword_results, vector_results)
-            results = [
-                {"id": doc.doc_id, "score": doc.fused_score}
-                for doc in fused[offset : offset + limit]
-            ]
+            results = []
+            for doc in fused[offset : offset + limit]:
+                result = {"id": doc.doc_id, "score": doc.fused_score}
+                if doc.doc_id in inner_hits_map:
+                    result["inner_hits"] = {"chunks": inner_hits_map[doc.doc_id]}
+                results.append(result)
         elif mode == "semantic" and vector_results:
-            results = [
-                {"id": doc_id, "score": score}
-                for _, doc_id, _, score in vector_results[offset : offset + limit]
-            ]
+            results = []
+            for _, doc_id, _, score in vector_results[offset : offset + limit]:
+                result = {"id": doc_id, "score": score}
+                if doc_id in inner_hits_map:
+                    result["inner_hits"] = {"chunks": inner_hits_map[doc_id]}
+                results.append(result)
         else:
+            # Keyword-only - no inner_hits
             results = [
                 {"id": doc_id, "score": score}
                 for _, doc_id, _, score in keyword_results[offset : offset + limit]
@@ -401,38 +478,79 @@ class TableIndex:
 
         return results
 
-    def _vector_search(self, query: str, limit: int) -> list[tuple[str, Any, dict, float]]:
-        """Execute vector similarity search."""
+    def _vector_search(
+        self, query: str, limit: int, inner_hits_size: int = 3
+    ) -> tuple[list[tuple[str, Any, dict, float]], dict[Any, list[dict]]]:
+        """Execute vector similarity search with chunking.
+
+        Returns documents with their best chunk scores, plus inner_hits
+        containing the matching chunks for each document.
+
+        Args:
+            query: Search query
+            limit: Max documents to return
+            inner_hits_size: Max chunks per document in inner_hits
+
+        Returns:
+            Tuple of:
+            - List of (table, row_id, source, score) for RRF fusion
+            - Dict mapping row_id -> list of chunk hits for inner_hits
+        """
         backend = self.config.embedding_backend
         if not backend:
-            return []
+            return [], {}
 
         query_embedding = backend.embed(query)
         embedding_json = json.dumps(query_embedding)
 
         vec_table = self.config.vec_table
+        chunks_table = self.config.chunks_table
         table = self.config.table
 
+        # Query chunks and join with metadata
+        # Get more chunks than needed to ensure we have enough unique documents
         sql = f"""
-            SELECT row_id, distance
-            FROM {vec_table}
-            WHERE embedding MATCH ?
-            ORDER BY distance
+            SELECT v.chunk_id, v.distance, c.row_id, c.chunk_idx, c.chunk_text
+            FROM {vec_table} v
+            JOIN {chunks_table} c ON v.chunk_id = c.chunk_id
+            WHERE v.embedding MATCH ?
+            ORDER BY v.distance
             LIMIT ?
         """
 
         try:
-            cursor = self._conn.execute(sql, (embedding_json, limit))
+            cursor = self._conn.execute(sql, (embedding_json, limit * inner_hits_size * 2))
         except sqlite3.OperationalError:
-            return []
+            return [], {}
 
-        results = []
+        # Group chunks by row_id
+        doc_chunks: dict[Any, list[dict]] = defaultdict(list)
+        doc_best_score: dict[Any, float] = {}
+
         for row in cursor:
-            row_id, distance = row
-            score = 1.0 - float(distance)  # Convert distance to similarity
+            chunk_id, distance, row_id, chunk_idx, chunk_text_str = row
+            score = 1.0 - float(distance)
+
+            # Track best score per document
+            if row_id not in doc_best_score or score > doc_best_score[row_id]:
+                doc_best_score[row_id] = score
+
+            # Add to inner_hits (up to inner_hits_size per doc)
+            if len(doc_chunks[row_id]) < inner_hits_size:
+                doc_chunks[row_id].append(
+                    {
+                        "chunk_idx": chunk_idx,
+                        "text": chunk_text_str,
+                        "_score": score,
+                    }
+                )
+
+        # Build document results sorted by best chunk score
+        results = []
+        for row_id, score in sorted(doc_best_score.items(), key=lambda x: -x[1])[:limit]:
             results.append((table, row_id, {}, score))
 
-        return results
+        return results, dict(doc_chunks)
 
     def _backfill_missing_vectors(self, limit: int = 100) -> int:
         """Embed rows that are missing from the vector table."""
@@ -450,9 +568,10 @@ class TableIndex:
         return " ".join(query.split())
 
     def drop(self) -> None:
-        """Remove the FTS5 table, triggers, and vector table."""
+        """Remove the FTS5 table, triggers, vector table, and chunks table."""
         fts = self.config.fts_table
         vec = self.config.vec_table
+        chunks = self.config.chunks_table
 
         # Drop triggers
         self._conn.execute(f"DROP TRIGGER IF EXISTS {fts}_ai")
@@ -461,6 +580,7 @@ class TableIndex:
 
         # Drop tables
         self._conn.execute(f"DROP TABLE IF EXISTS {fts}")
+        self._conn.execute(f"DROP TABLE IF EXISTS {chunks}")
         try:
             self._conn.execute(f"DROP TABLE IF EXISTS {vec}")
         except sqlite3.OperationalError:
@@ -472,7 +592,7 @@ class TableIndex:
         """Get index statistics."""
         table = self.config.table
         fts = self.config.fts_table
-        vec = self.config.vec_table
+        chunks = self.config.chunks_table
 
         cursor = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
         total_rows = cursor.fetchone()[0]
@@ -480,11 +600,14 @@ class TableIndex:
         cursor = self._conn.execute(f"SELECT COUNT(*) FROM {fts}")
         fts_rows = cursor.fetchone()[0]
 
-        vec_rows = 0
+        chunks_count = 0
+        rows_with_chunks = 0
         if self._has_vec:
             try:
-                cursor = self._conn.execute(f"SELECT COUNT(*) FROM {vec}")
-                vec_rows = cursor.fetchone()[0]
+                cursor = self._conn.execute(f"SELECT COUNT(*) FROM {chunks}")
+                chunks_count = cursor.fetchone()[0]
+                cursor = self._conn.execute(f"SELECT COUNT(DISTINCT row_id) FROM {chunks}")
+                rows_with_chunks = cursor.fetchone()[0]
             except sqlite3.OperationalError:
                 pass
 
@@ -492,6 +615,9 @@ class TableIndex:
             "table": table,
             "total_rows": total_rows,
             "fts_indexed": fts_rows,
-            "vectors_indexed": vec_rows,
-            "vectors_missing": total_rows - vec_rows if self._has_vec else None,
+            "chunks_indexed": chunks_count,
+            "rows_with_vectors": rows_with_chunks,
+            "rows_missing_vectors": total_rows - rows_with_chunks if self._has_vec else None,
+            "chunk_size": self.config.chunk_size,
+            "chunk_overlap": self.config.chunk_overlap,
         }

@@ -56,14 +56,12 @@ class TestReciprocalRankFusion:
 
         # Heavy keyword weight
         fused_keyword = reciprocal_rank_fusion(
-            keyword_results, vector_results,
-            keyword_weight=2.0, vector_weight=1.0
+            keyword_results, vector_results, keyword_weight=2.0, vector_weight=1.0
         )
 
         # Heavy vector weight
         fused_vector = reciprocal_rank_fusion(
-            keyword_results, vector_results,
-            keyword_weight=1.0, vector_weight=2.0
+            keyword_results, vector_results, keyword_weight=1.0, vector_weight=2.0
         )
 
         # First result should differ based on weights

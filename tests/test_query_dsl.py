@@ -109,14 +109,16 @@ class TestBoolQuery:
 
     def test_bool_must(self, compiler):
         """Test bool with must clause."""
-        result = compiler.compile({
-            "bool": {
-                "must": [
-                    {"term": {"status": "active"}},
-                    {"term": {"type": "article"}},
-                ]
+        result = compiler.compile(
+            {
+                "bool": {
+                    "must": [
+                        {"term": {"status": "active"}},
+                        {"term": {"type": "article"}},
+                    ]
+                }
             }
-        })
+        )
 
         assert "AND" in result.where_clause
         assert "$.status" in result.params
@@ -124,39 +126,45 @@ class TestBoolQuery:
 
     def test_bool_must_not(self, compiler):
         """Test bool with must_not clause."""
-        result = compiler.compile({
-            "bool": {
-                "must_not": [
-                    {"term": {"status": "deleted"}},
-                ]
+        result = compiler.compile(
+            {
+                "bool": {
+                    "must_not": [
+                        {"term": {"status": "deleted"}},
+                    ]
+                }
             }
-        })
+        )
 
         assert "NOT" in result.where_clause
         assert "$.status" in result.params
 
     def test_bool_should(self, compiler):
         """Test bool with should clause."""
-        result = compiler.compile({
-            "bool": {
-                "should": [
-                    {"term": {"status": "active"}},
-                    {"term": {"status": "pending"}},
-                ]
+        result = compiler.compile(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"status": "active"}},
+                        {"term": {"status": "pending"}},
+                    ]
+                }
             }
-        })
+        )
 
         assert "OR" in result.where_clause
 
     def test_bool_filter(self, compiler):
         """Test bool with filter clause (same as must for our purposes)."""
-        result = compiler.compile({
-            "bool": {
-                "filter": [
-                    {"term": {"status": "active"}},
-                ]
+        result = compiler.compile(
+            {
+                "bool": {
+                    "filter": [
+                        {"term": {"status": "active"}},
+                    ]
+                }
             }
-        })
+        )
 
         assert "$.status" in result.params
 
@@ -165,13 +173,15 @@ class TestBoolQuery:
 
         When must is present, should becomes optional (minimum_should_match defaults to 0).
         """
-        result = compiler.compile({
-            "bool": {
-                "must": [{"term": {"type": "article"}}],
-                "must_not": [{"term": {"status": "deleted"}}],
-                "should": [{"match": {"title": "important"}}],
+        result = compiler.compile(
+            {
+                "bool": {
+                    "must": [{"term": {"type": "article"}}],
+                    "must_not": [{"term": {"status": "deleted"}}],
+                    "should": [{"match": {"title": "important"}}],
+                }
             }
-        })
+        )
 
         assert "AND" in result.where_clause
         assert "NOT" in result.where_clause
@@ -181,23 +191,23 @@ class TestBoolQuery:
 
     def test_nested_bool(self, compiler):
         """Test nested bool queries."""
-        result = compiler.compile({
-            "bool": {
-                "must": [
-                    {
-                        "bool": {
-                            "should": [
-                                {"term": {"category": "tech"}},
-                                {"term": {"category": "science"}},
-                            ]
+        result = compiler.compile(
+            {
+                "bool": {
+                    "must": [
+                        {
+                            "bool": {
+                                "should": [
+                                    {"term": {"category": "tech"}},
+                                    {"term": {"category": "science"}},
+                                ]
+                            }
                         }
-                    }
-                ],
-                "filter": [
-                    {"term": {"status": "published"}}
-                ]
+                    ],
+                    "filter": [{"term": {"status": "published"}}],
+                }
             }
-        })
+        )
 
         assert "OR" in result.where_clause
         assert "AND" in result.where_clause

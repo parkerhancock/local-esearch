@@ -109,9 +109,7 @@ class TestTableIndex:
         index.setup()
 
         # Check triggers exist
-        cursor = db_with_table.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger'"
-        )
+        cursor = db_with_table.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
         triggers = [row[0] for row in cursor.fetchall()]
         assert "documents_fts_ai" in triggers
         assert "documents_fts_ad" in triggers

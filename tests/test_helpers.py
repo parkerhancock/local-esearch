@@ -1,6 +1,5 @@
 """Tests for helper functions (bulk, scan, etc.)."""
 
-
 from local_esearch import helpers
 
 
@@ -89,11 +88,7 @@ class TestScan:
         for i in range(10):
             es.index(index="test", id=str(i), document={"num": i, "even": i % 2 == 0})
 
-        docs = list(helpers.scan(
-            es,
-            index="test",
-            query={"term": {"even": True}}
-        ))
+        docs = list(helpers.scan(es, index="test", query={"term": {"even": True}}))
 
         assert len(docs) == 5
         for doc in docs:
@@ -126,10 +121,7 @@ class TestStreamingBulk:
 
     def test_streaming_bulk(self, es):
         """Test streaming bulk indexing."""
-        actions = [
-            {"_index": "test", "_id": str(i), "_source": {"num": i}}
-            for i in range(5)
-        ]
+        actions = [{"_index": "test", "_id": str(i), "_source": {"num": i}} for i in range(5)]
 
         results = list(helpers.streaming_bulk(es, actions))
 

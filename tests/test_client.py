@@ -92,11 +92,13 @@ class TestDocumentOperations:
         es.index(index="test", id="1", document={"title": "Doc 1"})
         es.index(index="test", id="2", document={"title": "Doc 2"})
 
-        result = es.mget(docs=[
-            {"_index": "test", "_id": "1"},
-            {"_index": "test", "_id": "2"},
-            {"_index": "test", "_id": "nonexistent"},
-        ])
+        result = es.mget(
+            docs=[
+                {"_index": "test", "_id": "1"},
+                {"_index": "test", "_id": "2"},
+                {"_index": "test", "_id": "nonexistent"},
+            ]
+        )
 
         assert len(result["docs"]) == 3
         assert result["docs"][0]["found"] is True
@@ -109,20 +111,14 @@ class TestSearch:
 
     def test_search_match_all(self, es_with_docs):
         """Test match_all query."""
-        response = es_with_docs.search(
-            index="test",
-            body={"query": {"match_all": {}}}
-        )
+        response = es_with_docs.search(index="test", body={"query": {"match_all": {}}})
 
         assert response["hits"]["total"]["value"] == 5
         assert len(response["hits"]["hits"]) == 5
 
     def test_search_match(self, es_with_docs):
         """Test match query."""
-        response = es_with_docs.search(
-            index="test",
-            body={"query": {"match": {"body": "python"}}}
-        )
+        response = es_with_docs.search(index="test", body={"query": {"match": {"body": "python"}}})
 
         assert response["hits"]["total"]["value"] >= 1
         # Should find docs mentioning python
@@ -131,10 +127,7 @@ class TestSearch:
 
     def test_search_term(self, es_with_docs):
         """Test term query (exact match)."""
-        response = es_with_docs.search(
-            index="test",
-            body={"query": {"term": {"category": "data"}}}
-        )
+        response = es_with_docs.search(index="test", body={"query": {"term": {"category": "data"}}})
 
         assert response["hits"]["total"]["value"] == 2
         for hit in response["hits"]["hits"]:
@@ -143,8 +136,7 @@ class TestSearch:
     def test_search_terms(self, es_with_docs):
         """Test terms query (match any)."""
         response = es_with_docs.search(
-            index="test",
-            body={"query": {"terms": {"category": ["data", "web"]}}}
+            index="test", body={"query": {"terms": {"category": ["data", "web"]}}}
         )
 
         assert response["hits"]["total"]["value"] == 3
@@ -163,7 +155,7 @@ class TestSearch:
                         ]
                     }
                 }
-            }
+            },
         )
 
         assert response["hits"]["total"]["value"] == 2
@@ -182,7 +174,7 @@ class TestSearch:
                         ]
                     }
                 }
-            }
+            },
         )
 
         assert response["hits"]["total"]["value"] == 3
@@ -196,8 +188,7 @@ class TestSearch:
         es.index(index="test", id="3", document={"title": "C", "price": 30})
 
         response = es.search(
-            index="test",
-            body={"query": {"range": {"price": {"gte": 15, "lte": 25}}}}
+            index="test", body={"query": {"range": {"price": {"gte": 15, "lte": 25}}}}
         )
 
         assert response["hits"]["total"]["value"] == 1
@@ -208,10 +199,7 @@ class TestSearch:
         es.index(index="test", id="1", document={"title": "Has tag", "tag": "important"})
         es.index(index="test", id="2", document={"title": "No tag"})
 
-        response = es.search(
-            index="test",
-            body={"query": {"exists": {"field": "tag"}}}
-        )
+        response = es.search(index="test", body={"query": {"exists": {"field": "tag"}}})
 
         assert response["hits"]["total"]["value"] == 1
         assert response["hits"]["hits"][0]["_source"]["title"] == "Has tag"
@@ -258,10 +246,7 @@ class TestSearch:
         result = es_with_docs.count(index="test")
         assert result["count"] == 5
 
-        result = es_with_docs.count(
-            index="test",
-            body={"query": {"term": {"category": "data"}}}
-        )
+        result = es_with_docs.count(index="test", body={"query": {"term": {"category": "data"}}})
         assert result["count"] == 2
 
 
@@ -285,7 +270,7 @@ class TestIndices:
                     "title": {"type": "text"},
                     "status": {"type": "keyword"},
                 }
-            }
+            },
         )
 
         info = es.indices.get("myindex")
@@ -309,10 +294,7 @@ class TestIndices:
     def test_put_mapping(self, es):
         """Test updating index mappings."""
         es.indices.create("myindex")
-        es.indices.put_mapping(
-            "myindex",
-            properties={"new_field": {"type": "keyword"}}
-        )
+        es.indices.put_mapping("myindex", properties={"new_field": {"type": "keyword"}})
 
         mappings = es.indices.get_mapping("myindex")
         assert "new_field" in mappings["myindex"]["mappings"]["properties"]
