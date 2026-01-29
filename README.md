@@ -56,6 +56,45 @@ response = es.search(
 )
 ```
 
+## Bolt-On Search for Existing Tables
+
+Add search to existing SQLite tables without changing your schema:
+
+```python
+from local_esearch import Elasticsearch
+
+# Connect to existing database
+es = Elasticsearch(path="./myapp.db")
+
+# Register an existing table for search
+es.register_table(
+    index="articles",           # ES index name
+    table="articles",           # Your existing table
+    id_column="id",             # Primary key column
+    text_columns=["title", "content", "summary"],
+    embedding_backend="voyage", # Optional: for semantic search
+)
+
+# Build the search index (one-time or periodic)
+es.indices.reindex("articles")
+
+# Search with familiar ES API
+response = es.search(
+    index="articles",
+    q="machine learning",
+    mode="hybrid",  # keyword + semantic
+)
+
+# Results contain row IDs from your table
+for hit in response["hits"]["hits"]:
+    row_id = hit["_id"]  # Use to join back to your table
+```
+
+**How it works:**
+- Creates FTS5 virtual table pointing at your table (no data duplication)
+- Auto-syncs via triggers on INSERT/UPDATE/DELETE
+- Vector embeddings stored in separate table, rebuilt on `reindex()`
+
 ## Query DSL Support
 
 - `match` - Full-text search

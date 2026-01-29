@@ -12,10 +12,12 @@ from local_esearch.exceptions import (
     NotFoundError,
     RequestError,
 )
+from local_esearch.table_index import TableIndex
 
 __version__ = "0.1.0"
 __all__ = [
     "Elasticsearch",
+    "TableIndex",
     "ElasticsearchException",
     "NotFoundError",
     "ConflictError",

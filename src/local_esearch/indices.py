@@ -289,3 +289,40 @@ class IndicesClient:
                 "mappings": json.loads(row[0]) if row[0] else {},
             }
         }
+
+    def reindex(
+        self,
+        index: str,
+        *,
+        only_missing: bool = False,
+        batch_size: int = 100,
+    ) -> dict[str, Any]:
+        """Rebuild search indexes for a registered table.
+
+        Only works for indexes created via `es.register_table()`.
+
+        Args:
+            index: Index name (must be a registered table)
+            only_missing: Only index rows missing from vector table
+            batch_size: Rows per batch for embedding API calls
+
+        Returns:
+            Stats dict with indexed counts
+        """
+        table_index = self._client._table_indexes.get(index)
+        if not table_index:
+            raise RequestError(
+                f"Index '{index}' is not a registered table. "
+                "Use es.register_table() first."
+            )
+
+        stats = table_index.reindex(
+            only_missing=only_missing,
+            batch_size=batch_size,
+        )
+
+        return {
+            "acknowledged": True,
+            "index": index,
+            "stats": stats,
+        }

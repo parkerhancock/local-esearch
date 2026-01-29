@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,6 +25,7 @@ from local_esearch.response import (
     format_update_response,
 )
 from local_esearch.schema import ensure_vector_table, extract_text_fields, init_database
+from local_esearch.table_index import TableIndex
 
 
 class Elasticsearch:
@@ -80,6 +82,9 @@ class Elasticsearch:
         # Query compiler
         self._query_compiler = QueryCompiler()
 
+        # Registry for table indexes (bolt-on search over existing tables)
+        self._table_indexes: dict[str, TableIndex] = {}
+
     def _load_sqlite_vec(self) -> bool:
         """Try to load sqlite-vec extension."""
         try:
@@ -101,6 +106,79 @@ class Elasticsearch:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    # -------------------------------------------------------------------------
+    # Table Registration (bolt-on search for existing tables)
+    # -------------------------------------------------------------------------
+
+    def register_table(
+        self,
+        index: str,
+        table: str,
+        *,
+        id_column: str = "id",
+        text_columns: list[str] | None = None,
+        embedding_text: Callable[[dict], str] | str | None = None,
+        embedding_backend: str | EmbeddingBackend | None = None,
+        setup: bool = True,
+    ) -> TableIndex:
+        """Register an existing table for search.
+
+        Creates FTS5 and vector indexes over an existing SQLite table,
+        enabling search without duplicating data.
+
+        Args:
+            index: ES index name to use for this table
+            table: Actual SQLite table name
+            id_column: Primary key column name
+            text_columns: Columns to include in full-text search
+            embedding_text: How to generate text for embeddings:
+                - str: column name to embed
+                - Callable: function(row_dict) -> str
+                - None: concatenate all text_columns
+            embedding_backend: Backend name or instance (overrides client default)
+            setup: Auto-create FTS5 table and triggers
+
+        Returns:
+            TableIndex instance for further configuration
+
+        Example:
+            es.register_table(
+                index="emails",
+                table="emails",
+                text_columns=["subject", "body", "sender"],
+                embedding_backend="voyage",
+            )
+            es.indices.reindex("emails")
+            results = es.search(index="emails", q="contract", mode="hybrid")
+        """
+        # Resolve embedding backend
+        if isinstance(embedding_backend, str):
+            backend = get_backend(embedding_backend)
+        elif embedding_backend is not None:
+            backend = embedding_backend
+        else:
+            backend = self._embedding_backend
+
+        # Create table index
+        table_index = TableIndex(
+            conn=self._conn,
+            table=table,
+            id_column=id_column,
+            text_columns=text_columns or [],
+            embedding_text=embedding_text,
+            embedding_backend=backend,
+        )
+
+        if setup:
+            table_index.setup()
+
+        self._table_indexes[index] = table_index
+        return table_index
+
+    def get_table_index(self, index: str) -> TableIndex | None:
+        """Get the TableIndex for a registered table."""
+        return self._table_indexes.get(index)
 
     # -------------------------------------------------------------------------
     # Document Operations
@@ -454,6 +532,18 @@ class Elasticsearch:
         """
         start_time = time.time()
 
+        # Check if this is a registered table index
+        if isinstance(index, str) and index in self._table_indexes:
+            return self._search_table_index(
+                index=index,
+                body=body,
+                q=q,
+                size=size,
+                from_=from_,
+                mode=mode,
+                start_time=start_time,
+            )
+
         # Normalize index to list
         if isinstance(index, str):
             indices = [index]
@@ -590,6 +680,55 @@ class Elasticsearch:
     # -------------------------------------------------------------------------
     # Internal Methods
     # -------------------------------------------------------------------------
+
+    def _search_table_index(
+        self,
+        index: str,
+        body: dict[str, Any] | None,
+        q: str | None,
+        size: int,
+        from_: int,
+        mode: Literal["keyword", "semantic", "hybrid"],
+        start_time: float,
+    ) -> dict[str, Any]:
+        """Search a registered table index."""
+        table_index = self._table_indexes[index]
+
+        # Extract query text
+        query_text = q
+        if not query_text and body:
+            query = body.get("query", {})
+            query_text = self._extract_query_text(query, None)
+
+        if not query_text:
+            # No query - return empty results
+            took_ms = int((time.time() - start_time) * 1000)
+            return format_search_response([], 0, took_ms, None)
+
+        # Search the table index
+        results = table_index.search(
+            query=query_text,
+            mode=mode,
+            limit=size,
+            offset=from_,
+        )
+
+        # Format as ES response
+        hits = []
+        for result in results:
+            hit = format_hit(
+                index=index,
+                doc_id=str(result["id"]),
+                source={"_table_row_id": result["id"]},
+                score=result["score"],
+            )
+            hits.append(hit)
+
+        total = len(results)  # Note: This is the returned count, not true total
+        max_score = results[0]["score"] if results else None
+        took_ms = int((time.time() - start_time) * 1000)
+
+        return format_search_response(hits, total, took_ms, max_score)
 
     def _ensure_index(self, index: str) -> None:
         """Ensure index exists, creating if needed."""
