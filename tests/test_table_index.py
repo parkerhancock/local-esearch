@@ -36,13 +36,36 @@ def db_with_table():
 
 
 @pytest.fixture
-def es_with_table(db_with_table):
-    """Create ES client connected to existing database with table."""
-    # Create ES client using the same connection
-    es = Elasticsearch(path=":memory:")
-    # Replace connection with our pre-populated one
-    es._conn.close()
-    es._conn = db_with_table
+def es_with_table(tmp_path):
+    """Create ES client with an existing user table."""
+    db_path = tmp_path / "test.db"
+
+    # First, create the user's table directly
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE documents (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            content TEXT,
+            category TEXT
+        )
+    """)
+    docs = [
+        (1, "Python Programming", "Learn Python basics and advanced topics", "tech"),
+        (2, "JavaScript Guide", "Modern JavaScript development patterns", "tech"),
+        (3, "Data Science", "Python for data analysis and machine learning", "data"),
+        (4, "Machine Learning", "Introduction to ML algorithms", "data"),
+        (5, "Web Development", "Building web apps with JavaScript and React", "web"),
+    ]
+    conn.executemany(
+        "INSERT INTO documents (id, title, content, category) VALUES (?, ?, ?, ?)",
+        docs,
+    )
+    conn.commit()
+    conn.close()
+
+    # Now connect with ES client (will add our schema tables)
+    es = Elasticsearch(path=str(db_path))
 
     # Register the existing table
     es.register_table(
@@ -52,7 +75,8 @@ def es_with_table(db_with_table):
         text_columns=["title", "content"],
     )
 
-    return es
+    yield es
+    es.close()
 
 
 class TestTableIndex:
@@ -251,11 +275,25 @@ class TestTableIndex:
 class TestElasticsearchWithTable:
     """Test ES client with registered tables."""
 
-    def test_register_table(self, db_with_table):
+    def test_register_table(self, tmp_path):
         """Test registering an existing table."""
-        es = Elasticsearch(path=":memory:")
-        es._conn.close()
-        es._conn = db_with_table
+        db_path = tmp_path / "test.db"
+
+        # Create existing table first
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                content TEXT
+            )
+        """)
+        conn.execute("INSERT INTO documents VALUES (1, 'Test', 'Content')")
+        conn.commit()
+        conn.close()
+
+        # Connect with ES client
+        es = Elasticsearch(path=str(db_path))
 
         table_index = es.register_table(
             index="docs",
@@ -265,6 +303,7 @@ class TestElasticsearchWithTable:
 
         assert table_index is not None
         assert "docs" in es._table_indexes
+        es.close()
 
     def test_search_registered_table(self, es_with_table):
         """Test searching a registered table via ES API."""
@@ -348,3 +387,122 @@ class TestEmbeddingText:
         row = {"id": 1, "title": "Test", "content": "Hello world", "category": "test"}
         text = index._get_embedding_text(row)
         assert text == "Test Hello world"
+
+
+class TestPersistence:
+    """Test that table registrations persist across reconnection."""
+
+    def test_registration_persists(self, tmp_path):
+        """Test that register_table survives reconnection."""
+        db_path = tmp_path / "test.db"
+
+        # First connection: create table and register
+        conn1 = sqlite3.connect(str(db_path))
+        conn1.execute("""
+            CREATE TABLE articles (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                body TEXT
+            )
+        """)
+        conn1.execute("INSERT INTO articles VALUES (1, 'Test', 'Content')")
+        conn1.commit()
+        conn1.close()
+
+        # Register with ES client
+        es1 = Elasticsearch(path=str(db_path))
+        es1.register_table(
+            index="articles",
+            table="articles",
+            text_columns=["title", "body"],
+        )
+        es1.indices.reindex("articles")
+        es1.close()
+
+        # Second connection: should auto-load registration
+        es2 = Elasticsearch(path=str(db_path))
+
+        # Should already be registered
+        assert "articles" in es2._table_indexes
+
+        # Should be searchable without re-registering
+        response = es2.search(index="articles", q="test")
+        assert response["hits"]["total"]["value"] >= 1
+
+        es2.close()
+
+    def test_unregister_table(self, tmp_path):
+        """Test unregistering a table."""
+        db_path = tmp_path / "test.db"
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, text TEXT)")
+        conn.commit()
+        conn.close()
+
+        es = Elasticsearch(path=str(db_path))
+        es.register_table(index="docs", table="docs", text_columns=["text"])
+
+        assert "docs" in es._table_indexes
+
+        # Unregister
+        result = es.unregister_table("docs")
+        assert result is True
+        assert "docs" not in es._table_indexes
+
+        # Unregister again returns False
+        result = es.unregister_table("docs")
+        assert result is False
+
+        es.close()
+
+    def test_unregister_with_drop(self, tmp_path):
+        """Test unregistering with drop_indexes=True removes FTS tables."""
+        db_path = tmp_path / "test.db"
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, text TEXT)")
+        conn.commit()
+        conn.close()
+
+        es = Elasticsearch(path=str(db_path))
+        es.register_table(index="docs", table="docs", text_columns=["text"])
+
+        # Verify FTS table exists
+        cursor = es._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_fts'"
+        )
+        assert cursor.fetchone() is not None
+
+        # Unregister with drop
+        es.unregister_table("docs", drop_indexes=True)
+
+        # FTS table should be gone
+        cursor = es._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_fts'"
+        )
+        assert cursor.fetchone() is None
+
+        es.close()
+
+    def test_multiple_registrations_persist(self, tmp_path):
+        """Test multiple table registrations all persist."""
+        db_path = tmp_path / "test.db"
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)")
+        conn.commit()
+        conn.close()
+
+        # Register multiple tables
+        es1 = Elasticsearch(path=str(db_path))
+        es1.register_table(index="users", table="users", text_columns=["name"])
+        es1.register_table(index="posts", table="posts", text_columns=["title"])
+        es1.close()
+
+        # Reconnect and verify both loaded
+        es2 = Elasticsearch(path=str(db_path))
+        assert "users" in es2._table_indexes
+        assert "posts" in es2._table_indexes
+        es2.close()

@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from local_esearch.embeddings.base import EmbeddingBackend
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Core schema - always created
 CORE_SCHEMA = """
@@ -44,6 +44,17 @@ CREATE TABLE IF NOT EXISTS _documents (
 -- Index for fast lookups
 CREATE INDEX IF NOT EXISTS idx_documents_index_id ON _documents(_index, _id);
 CREATE INDEX IF NOT EXISTS idx_documents_index ON _documents(_index);
+
+-- Registered table indexes (for bolt-on search)
+CREATE TABLE IF NOT EXISTS _table_indexes (
+    index_name TEXT PRIMARY KEY,
+    table_name TEXT NOT NULL,
+    id_column TEXT NOT NULL,
+    text_columns_json TEXT NOT NULL,
+    embedding_text TEXT,
+    embedding_backend TEXT,
+    created_at REAL
+);
 """
 
 # FTS5 schema - separate for clarity

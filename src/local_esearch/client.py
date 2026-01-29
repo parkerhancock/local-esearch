@@ -85,6 +85,9 @@ class Elasticsearch:
         # Registry for table indexes (bolt-on search over existing tables)
         self._table_indexes: dict[str, TableIndex] = {}
 
+        # Auto-load any previously registered table indexes
+        self._load_table_indexes()
+
     def _load_sqlite_vec(self) -> bool:
         """Try to load sqlite-vec extension."""
         try:
@@ -174,11 +177,124 @@ class Elasticsearch:
             table_index.setup()
 
         self._table_indexes[index] = table_index
+
+        # Persist registration for reconnection
+        backend_name = None
+        if isinstance(embedding_backend, str):
+            backend_name = embedding_backend
+        elif backend and hasattr(backend, "model_name"):
+            # Try to determine backend type from model name
+            if "voyage" in getattr(backend, "model_name", "").lower():
+                backend_name = "voyage"
+            elif "embedding" in getattr(backend, "model_name", "").lower():
+                backend_name = "gemini"
+
+        self._save_table_index(
+            index=index,
+            table=table,
+            id_column=id_column,
+            text_columns=text_columns or [],
+            embedding_text=embedding_text if isinstance(embedding_text, str) else None,
+            embedding_backend=backend_name,
+        )
+
         return table_index
 
     def get_table_index(self, index: str) -> TableIndex | None:
         """Get the TableIndex for a registered table."""
         return self._table_indexes.get(index)
+
+    def _load_table_indexes(self) -> None:
+        """Load previously registered table indexes from metadata."""
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT index_name, table_name, id_column, text_columns_json,
+                       embedding_text, embedding_backend
+                FROM _table_indexes
+            """)
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet (old schema)
+            return
+
+        for row in cursor.fetchall():
+            index_name, table_name, id_column, text_cols_json, emb_text, emb_backend = row
+
+            # Parse text columns
+            text_columns = json.loads(text_cols_json) if text_cols_json else []
+
+            # Resolve embedding backend
+            if emb_backend:
+                backend = get_backend(emb_backend)
+            else:
+                backend = self._embedding_backend
+
+            # Recreate TableIndex (FTS5 tables and triggers already exist)
+            table_index = TableIndex(
+                conn=self._conn,
+                table=table_name,
+                id_column=id_column,
+                text_columns=text_columns,
+                embedding_text=emb_text,  # Note: callable not supported for persistence
+                embedding_backend=backend,
+            )
+            # Don't call setup() - tables already exist
+            self._table_indexes[index_name] = table_index
+
+    def _save_table_index(
+        self,
+        index: str,
+        table: str,
+        id_column: str,
+        text_columns: list[str],
+        embedding_text: str | None,
+        embedding_backend: str | None,
+    ) -> None:
+        """Persist table index registration to metadata."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO _table_indexes
+                (index_name, table_name, id_column, text_columns_json,
+                 embedding_text, embedding_backend, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                index,
+                table,
+                id_column,
+                json.dumps(text_columns),
+                embedding_text if isinstance(embedding_text, str) else None,
+                embedding_backend,
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def unregister_table(self, index: str, *, drop_indexes: bool = False) -> bool:
+        """Unregister a table index.
+
+        Args:
+            index: ES index name to unregister
+            drop_indexes: Also drop the FTS5 and vector tables
+
+        Returns:
+            True if index was registered, False otherwise
+        """
+        table_index = self._table_indexes.pop(index, None)
+        if not table_index:
+            return False
+
+        # Remove from metadata
+        cursor = self._conn.cursor()
+        cursor.execute("DELETE FROM _table_indexes WHERE index_name = ?", (index,))
+        self._conn.commit()
+
+        # Optionally drop the FTS5/vector tables
+        if drop_indexes:
+            table_index.drop()
+
+        return True
 
     # -------------------------------------------------------------------------
     # Document Operations
