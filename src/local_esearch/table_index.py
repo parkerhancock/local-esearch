@@ -202,6 +202,33 @@ class TableIndex:
         )
         self._conn.commit()
 
+        # Create trigger to clean up chunks when parent row is deleted
+        self._create_chunks_delete_trigger()
+
+    def _create_chunks_delete_trigger(self) -> None:
+        """Create trigger to delete chunks when parent row is deleted."""
+        table = self.config.table
+        chunks_table = self.config.chunks_table
+        vec_table = self.config.vec_table
+        id_col = self.config.id_column
+
+        # Delete from chunks table
+        self._conn.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {chunks_table}_ad AFTER DELETE ON {table} BEGIN
+                DELETE FROM {chunks_table} WHERE row_id = old.{id_col};
+            END
+        """)
+
+        # Delete from vector table (chunk_id format is "row_id:chunk_idx")
+        # Use LIKE pattern to match all chunks for this row
+        self._conn.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {vec_table}_ad AFTER DELETE ON {table} BEGIN
+                DELETE FROM {vec_table} WHERE chunk_id LIKE (old.{id_col} || ':%');
+            END
+        """)
+
+        self._conn.commit()
+
     def reindex(
         self,
         only_missing: bool = False,
@@ -573,10 +600,14 @@ class TableIndex:
         vec = self.config.vec_table
         chunks = self.config.chunks_table
 
-        # Drop triggers
+        # Drop FTS triggers
         self._conn.execute(f"DROP TRIGGER IF EXISTS {fts}_ai")
         self._conn.execute(f"DROP TRIGGER IF EXISTS {fts}_ad")
         self._conn.execute(f"DROP TRIGGER IF EXISTS {fts}_au")
+
+        # Drop chunks/vec cleanup triggers
+        self._conn.execute(f"DROP TRIGGER IF EXISTS {chunks}_ad")
+        self._conn.execute(f"DROP TRIGGER IF EXISTS {vec}_ad")
 
         # Drop tables
         self._conn.execute(f"DROP TABLE IF EXISTS {fts}")

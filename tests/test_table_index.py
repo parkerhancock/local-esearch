@@ -6,6 +6,23 @@ import pytest
 from local_esearch import Elasticsearch, TableIndex
 
 
+class MockEmbeddingBackend:
+    """Mock embedding backend for testing vector operations."""
+
+    backend_name = "mock"
+    dimensions = 8
+    model_name = "mock-test-model"
+
+    def embed(self, text: str) -> list[float]:
+        """Generate a deterministic embedding based on text hash."""
+        h = hash(text) % 1000
+        return [(h + i) / 1000.0 for i in range(self.dimensions)]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed multiple texts."""
+        return [self.embed(t) for t in texts]
+
+
 @pytest.fixture
 def db_with_table():
     """Create an in-memory database with an existing table."""
@@ -228,6 +245,69 @@ class TestTableIndex:
         # Should no longer find it
         results = index.search("python programming", mode="keyword")
         assert not any(r["id"] == 1 for r in results)
+
+    def test_chunks_and_vec_cleanup_on_delete(self, db_with_table):
+        """Test chunks and vector entries are deleted when parent row is deleted."""
+        # Enable sqlite-vec if available
+        try:
+            db_with_table.enable_load_extension(True)
+            import sqlite_vec
+
+            sqlite_vec.load(db_with_table)
+        except Exception:
+            pytest.skip("sqlite-vec not available")
+
+        backend = MockEmbeddingBackend()
+        index = TableIndex(
+            conn=db_with_table,
+            table="documents",
+            id_column="id",
+            text_columns=["title", "content"],
+            embedding_backend=backend,
+            chunk_size=10,  # Small chunks for test
+            chunk_overlap=2,
+        )
+        index.setup()
+        index.reindex()
+
+        # Verify chunks exist for row 1
+        cursor = db_with_table.execute(
+            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (1,)
+        )
+        chunks_before = cursor.fetchone()[0]
+        assert chunks_before > 0, "Expected chunks for row 1"
+
+        # Verify vector entries exist for row 1 (format: "row_id:chunk_idx")
+        cursor = db_with_table.execute(
+            "SELECT COUNT(*) FROM documents_vec WHERE chunk_id LIKE '1:%'"
+        )
+        vec_before = cursor.fetchone()[0]
+        assert vec_before > 0, "Expected vector entries for row 1"
+
+        # Delete the parent row
+        db_with_table.execute("DELETE FROM documents WHERE id = ?", (1,))
+        db_with_table.commit()
+
+        # Verify chunks are gone
+        cursor = db_with_table.execute(
+            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (1,)
+        )
+        chunks_after = cursor.fetchone()[0]
+        assert chunks_after == 0, "Chunks should be deleted"
+
+        # Verify vector entries are gone
+        cursor = db_with_table.execute(
+            "SELECT COUNT(*) FROM documents_vec WHERE chunk_id LIKE '1:%'"
+        )
+        vec_after = cursor.fetchone()[0]
+        assert vec_after == 0, "Vector entries should be deleted"
+
+        # Verify other rows' data is still intact
+        cursor = db_with_table.execute(
+            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (2,)
+        )
+        other_chunks = cursor.fetchone()[0]
+        assert other_chunks > 0, "Other rows should still have chunks"
 
     def test_stats(self, db_with_table):
         """Test stats returns correct counts."""

@@ -1162,6 +1162,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "sqlite-vec" },
 ]
 
 [package.metadata]
@@ -1184,6 +1185,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.23.0" },
     { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "sqlite-vec", specifier = ">=0.1.0" },
 ]
 
 [[package]]
