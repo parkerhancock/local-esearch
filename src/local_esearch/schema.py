@@ -107,9 +107,7 @@ def init_database(
     cursor = conn.cursor()
 
     # Check current schema version
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_version'"
-    )
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_version'")
     if cursor.fetchone():
         cursor.execute("SELECT MAX(version) FROM _schema_version")
         row = cursor.fetchone()
@@ -162,9 +160,7 @@ def ensure_vector_table(
         return False
 
     # Check if table exists
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='_documents_vec'"
-    )
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_documents_vec'")
     if cursor.fetchone():
         return True
 

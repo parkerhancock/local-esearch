@@ -182,12 +182,8 @@ class Elasticsearch:
         backend_name = None
         if isinstance(embedding_backend, str):
             backend_name = embedding_backend
-        elif backend and hasattr(backend, "model_name"):
-            # Try to determine backend type from model name
-            if "voyage" in getattr(backend, "model_name", "").lower():
-                backend_name = "voyage"
-            elif "embedding" in getattr(backend, "model_name", "").lower():
-                backend_name = "gemini"
+        elif backend and hasattr(backend, "backend_name"):
+            backend_name = backend.backend_name
 
         self._save_table_index(
             index=index,
@@ -607,11 +603,13 @@ class Elasticsearch:
                 result = self.get(index=doc_index, id=doc_id)
                 results.append(result)
             except NotFoundError:
-                results.append({
-                    "_index": doc_index,
-                    "_id": doc_id,
-                    "found": False,
-                })
+                results.append(
+                    {
+                        "_index": doc_index,
+                        "_id": doc_id,
+                        "found": False,
+                    }
+                )
 
         return {"docs": results}
 

@@ -48,11 +48,18 @@ def bulk(
         source = action.get("_source")
 
         if not index:
-            errors.append(format_bulk_item(
-                op_type, "", doc_id or "",
-                status=400,
-                error={"type": "action_request_validation_exception", "reason": "index is missing"}
-            ))
+            errors.append(
+                format_bulk_item(
+                    op_type,
+                    "",
+                    doc_id or "",
+                    status=400,
+                    error={
+                        "type": "action_request_validation_exception",
+                        "reason": "index is missing",
+                    },
+                )
+            )
             continue
 
         try:
@@ -78,20 +85,26 @@ def bulk(
                 success_count += 1
 
             else:
-                errors.append(format_bulk_item(
-                    op_type, index, doc_id or "",
-                    status=400,
-                    error={
-                        "type": "illegal_argument_exception",
-                        "reason": f"Unknown op_type: {op_type}",
-                    },
-                ))
+                errors.append(
+                    format_bulk_item(
+                        op_type,
+                        index,
+                        doc_id or "",
+                        status=400,
+                        error={
+                            "type": "illegal_argument_exception",
+                            "reason": f"Unknown op_type: {op_type}",
+                        },
+                    )
+                )
 
         except Exception as e:
             error_item = format_bulk_item(
-                op_type, index, doc_id or "",
+                op_type,
+                index,
+                doc_id or "",
                 status=getattr(e, "status_code", 500),
-                error={"type": type(e).__name__, "reason": str(e)}
+                error={"type": type(e).__name__, "reason": str(e)},
             )
             errors.append(error_item)
 

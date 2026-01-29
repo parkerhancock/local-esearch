@@ -12,6 +12,7 @@ class GeminiBackend:
     Requires GOOGLE_API_KEY environment variable.
     """
 
+    backend_name: str = "gemini"
     dimensions: int = 768
     model_name: str = "text-embedding-004"
 

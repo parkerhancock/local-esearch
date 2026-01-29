@@ -12,6 +12,7 @@ class OpenAIBackend:
     Requires OPENAI_API_KEY environment variable.
     """
 
+    backend_name: str = "openai"
     dimensions: int = 1536
     model_name: str = "text-embedding-3-small"
 
@@ -26,8 +27,7 @@ class OpenAIBackend:
             from openai import OpenAI
         except ImportError as e:
             raise ImportError(
-                "openai package required for OpenAI backend. "
-                "Install with: pip install openai"
+                "openai package required for OpenAI backend. Install with: pip install openai"
             ) from e
 
         if model:

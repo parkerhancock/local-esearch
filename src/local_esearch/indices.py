@@ -312,8 +312,7 @@ class IndicesClient:
         table_index = self._client._table_indexes.get(index)
         if not table_index:
             raise RequestError(
-                f"Index '{index}' is not a registered table. "
-                "Use es.register_table() first."
+                f"Index '{index}' is not a registered table. Use es.register_table() first."
             )
 
         stats = table_index.reindex(

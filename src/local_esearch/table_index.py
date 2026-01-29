@@ -372,9 +372,7 @@ class TableIndex:
 
         return results
 
-    def _keyword_search(
-        self, query: str, limit: int
-    ) -> list[tuple[str, Any, dict, float]]:
+    def _keyword_search(self, query: str, limit: int) -> list[tuple[str, Any, dict, float]]:
         """Execute FTS5 keyword search."""
         fts = self.config.fts_table
         table = self.config.table
@@ -403,9 +401,7 @@ class TableIndex:
 
         return results
 
-    def _vector_search(
-        self, query: str, limit: int
-    ) -> list[tuple[str, Any, dict, float]]:
+    def _vector_search(self, query: str, limit: int) -> list[tuple[str, Any, dict, float]]:
         """Execute vector similarity search."""
         backend = self.config.embedding_backend
         if not backend:

@@ -12,6 +12,7 @@ class VoyageBackend:
     Requires VOYAGE_API_KEY environment variable.
     """
 
+    backend_name: str = "voyage"
     dimensions: int = 1024
     model_name: str = "voyage-3-lite"
 
@@ -26,8 +27,7 @@ class VoyageBackend:
             import voyageai
         except ImportError as e:
             raise ImportError(
-                "voyageai package required for Voyage backend. "
-                "Install with: pip install voyageai"
+                "voyageai package required for Voyage backend. Install with: pip install voyageai"
             ) from e
 
         if model:
