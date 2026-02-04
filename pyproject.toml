@@ -4,18 +4,24 @@ version = "0.1.0"
 description = "Elasticsearch-compatible API backed by SQLite + FTS5 + sqlite-vec"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "google-genai>=1.59.0",
+    "sqlite-vec>=0.1.6",
+]
 
 [project.optional-dependencies]
 voyage = ["voyageai>=0.2.0"]
-gemini = ["google-generativeai>=0.5.0"]
+gemini = ["google-genai>=1.0.0"]
 openai = ["openai>=1.0.0"]
 vector = ["sqlite-vec>=0.1.0"]
+postgres = ["psycopg[binary]>=3.0.0", "pgvector>=0.2.0"]
 all = [
     "voyageai>=0.2.0",
-    "google-generativeai>=0.5.0",
+    "google-genai>=1.0.0",
     "openai>=1.0.0",
     "sqlite-vec>=0.1.0",
+    "psycopg[binary]>=3.0.0",
+    "pgvector>=0.2.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -31,6 +37,8 @@ packages = ["src/local_esearch"]
 
 [dependency-groups]
 dev = [
+    "pgvector>=0.2.0",
+    "psycopg[binary]>=3.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",

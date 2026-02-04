@@ -19,10 +19,11 @@ class TestBasicQueries:
         assert result.params == []
 
     def test_match(self, compiler):
-        """Test match query compiles to FTS5."""
+        """Test match query compiles to FTS."""
         result = compiler.compile({"match": {"title": "hello world"}})
 
-        assert "MATCH" in result.where_clause
+        # FTS is handled by document_fts_search_sql, not where_clause
+        assert result.where_clause == ""
         assert result.uses_fts is True
         assert result.fts_query == "hello world"
 

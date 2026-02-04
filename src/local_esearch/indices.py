@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -16,12 +15,12 @@ if TYPE_CHECKING:
 class IndicesClient:
     """Elasticsearch-compatible indices management API."""
 
-    def __init__(self, client: Elasticsearch):
+    def __init__(self, client: "Elasticsearch"):
         self._client = client
 
     @property
-    def _conn(self) -> sqlite3.Connection:
-        return self._client._conn
+    def _backend(self):
+        return self._client._backend
 
     def create(
         self,
@@ -47,14 +46,12 @@ class IndicesClient:
             mappings = mappings or body.get("mappings")
             settings = settings or body.get("settings")
 
-        cursor = self._conn.cursor()
-
         # Check if index already exists
-        cursor.execute("SELECT 1 FROM _indices WHERE name = ?", (index,))
-        if cursor.fetchone():
+        rows = self._backend.execute("SELECT 1 FROM _indices WHERE name = ?", (index,))
+        if rows:
             raise RequestError(f"Index '{index}' already exists")
 
-        cursor.execute(
+        self._backend.execute(
             """
             INSERT INTO _indices (name, mappings_json, settings_json, created_at)
             VALUES (?, ?, ?, ?)
@@ -63,10 +60,10 @@ class IndicesClient:
                 index,
                 json.dumps(mappings) if mappings else None,
                 json.dumps(settings) if settings else None,
-                time.time(),
+                self._backend.timestamp_now(),
             ),
         )
-        self._conn.commit()
+        self._backend.commit()
 
         return {
             "acknowledged": True,
@@ -83,34 +80,31 @@ class IndicesClient:
         Returns:
             Acknowledgment response
         """
-        cursor = self._conn.cursor()
-
         # Handle wildcard pattern
         if "*" in index:
             pattern = index.replace("*", "%")
-            cursor.execute("SELECT name FROM _indices WHERE name LIKE ?", (pattern,))
-            indices_to_delete = [row[0] for row in cursor.fetchall()]
+            rows = self._backend.execute(
+                "SELECT name FROM _indices WHERE name LIKE ?", (pattern,)
+            )
+            indices_to_delete = [row["name"] for row in rows]
         else:
-            cursor.execute("SELECT 1 FROM _indices WHERE name = ?", (index,))
-            if not cursor.fetchone():
+            rows = self._backend.execute(
+                "SELECT 1 FROM _indices WHERE name = ?", (index,)
+            )
+            if not rows:
                 raise NotFoundError(f"Index '{index}' not found")
             indices_to_delete = [index]
 
         for idx in indices_to_delete:
             # Delete documents first
-            cursor.execute("DELETE FROM _documents WHERE _index = ?", (idx,))
+            self._backend.execute("DELETE FROM _documents WHERE _index = ?", (idx,))
             # Delete vector embeddings if table exists
-            try:
-                cursor.execute(
-                    "DELETE FROM _documents_vec WHERE doc_key LIKE ?",
-                    (f"{idx}:%",),
-                )
-            except sqlite3.OperationalError:
-                pass  # Vector table doesn't exist
+            if self._backend.vector_available():
+                self._backend.vector_delete_pattern("_documents_vec", f"{idx}:%")
             # Delete index metadata
-            cursor.execute("DELETE FROM _indices WHERE name = ?", (idx,))
+            self._backend.execute("DELETE FROM _indices WHERE name = ?", (idx,))
 
-        self._conn.commit()
+        self._backend.commit()
 
         return {"acknowledged": True}
 
@@ -123,9 +117,10 @@ class IndicesClient:
         Returns:
             True if index exists
         """
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT 1 FROM _indices WHERE name = ?", (index,))
-        return cursor.fetchone() is not None
+        rows = self._backend.execute(
+            "SELECT 1 FROM _indices WHERE name = ?", (index,)
+        )
+        return len(rows) > 0
 
     def get(self, index: str) -> dict[str, Any]:
         """Get index metadata.
@@ -136,20 +131,23 @@ class IndicesClient:
         Returns:
             Index settings and mappings
         """
-        cursor = self._conn.cursor()
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT mappings_json, settings_json, created_at FROM _indices WHERE name = ?",
             (index,),
         )
-        row = cursor.fetchone()
-        if not row:
+        if not rows:
             raise NotFoundError(f"Index '{index}' not found")
 
-        mappings_json, settings_json, created_at = row
+        row = rows[0]
+        mappings_json = row["mappings_json"]
+        settings_json = row["settings_json"]
+        # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+        mappings = mappings_json if isinstance(mappings_json, dict) else (json.loads(mappings_json) if mappings_json else {})
+        settings = settings_json if isinstance(settings_json, dict) else (json.loads(settings_json) if settings_json else {})
         return {
             index: {
-                "mappings": json.loads(mappings_json) if mappings_json else {},
-                "settings": json.loads(settings_json) if settings_json else {},
+                "mappings": mappings,
+                "settings": settings,
             }
         }
 
@@ -167,7 +165,7 @@ class IndicesClient:
         """
         # FTS5 triggers handle sync automatically
         # Just commit any pending transactions
-        self._conn.commit()
+        self._backend.commit()
 
         return {
             "_shards": {
@@ -186,29 +184,27 @@ class IndicesClient:
         Returns:
             Index statistics
         """
-        cursor = self._conn.cursor()
-
         if index:
             indices = [index]
         else:
-            cursor.execute("SELECT name FROM _indices")
-            indices = [row[0] for row in cursor.fetchall()]
+            rows = self._backend.execute("SELECT name FROM _indices")
+            indices = [row["name"] for row in rows]
 
         all_stats = {}
         total_docs = 0
 
         for idx in indices:
-            cursor.execute(
-                "SELECT COUNT(*) FROM _documents WHERE _index = ?",
+            rows = self._backend.execute(
+                "SELECT COUNT(*) as cnt FROM _documents WHERE _index = ?",
                 (idx,),
             )
-            doc_count = cursor.fetchone()[0]
+            doc_count = rows[0]["cnt"] if rows else 0
             total_docs += doc_count
 
             all_stats[idx] = {
                 "primaries": {
                     "docs": {"count": doc_count, "deleted": 0},
-                    "store": {"size_in_bytes": 0},  # Could calculate actual size
+                    "store": {"size_in_bytes": 0},
                 },
                 "total": {
                     "docs": {"count": doc_count, "deleted": 0},
@@ -242,15 +238,16 @@ class IndicesClient:
         Returns:
             Acknowledgment response
         """
-        cursor = self._conn.cursor()
-
         # Get existing mappings
-        cursor.execute("SELECT mappings_json FROM _indices WHERE name = ?", (index,))
-        row = cursor.fetchone()
-        if not row:
+        rows = self._backend.execute(
+            "SELECT mappings_json FROM _indices WHERE name = ?", (index,)
+        )
+        if not rows:
             raise NotFoundError(f"Index '{index}' not found")
 
-        existing = json.loads(row[0]) if row[0] else {}
+        mappings_data = rows[0]["mappings_json"]
+        # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+        existing = mappings_data if isinstance(mappings_data, dict) else (json.loads(mappings_data) if mappings_data else {})
 
         # Merge new mappings
         if body:
@@ -261,11 +258,11 @@ class IndicesClient:
         if properties:
             existing.setdefault("properties", {}).update(properties)
 
-        cursor.execute(
+        self._backend.execute(
             "UPDATE _indices SET mappings_json = ? WHERE name = ?",
             (json.dumps(existing), index),
         )
-        self._conn.commit()
+        self._backend.commit()
 
         return {"acknowledged": True}
 
@@ -278,15 +275,18 @@ class IndicesClient:
         Returns:
             Index mappings
         """
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT mappings_json FROM _indices WHERE name = ?", (index,))
-        row = cursor.fetchone()
-        if not row:
+        rows = self._backend.execute(
+            "SELECT mappings_json FROM _indices WHERE name = ?", (index,)
+        )
+        if not rows:
             raise NotFoundError(f"Index '{index}' not found")
 
+        mappings_data = rows[0]["mappings_json"]
+        # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+        mappings = mappings_data if isinstance(mappings_data, dict) else (json.loads(mappings_data) if mappings_data else {})
         return {
             index: {
-                "mappings": json.loads(row[0]) if row[0] else {},
+                "mappings": mappings,
             }
         }
 

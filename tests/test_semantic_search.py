@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 from local_esearch import Elasticsearch, TableIndex
+from local_esearch.backends.sqlite import SQLiteBackend
 
 
 class TestSemanticSearchWithVec:
@@ -169,20 +170,19 @@ class TestTableIndexDirectAPI:
         """Test vector search on TableIndex directly."""
         db_path = tmp_path / "test.db"
 
-        conn = sqlite3.connect(str(db_path))
+        # Check if sqlite-vec is available
         try:
-            conn.enable_load_extension(True)
             import sqlite_vec
-
-            sqlite_vec.load(conn)
-        except Exception:
-            conn.close()
+        except ImportError:
             pytest.skip("sqlite-vec not available")
 
+        # Create table with data using temp connection
+        conn = sqlite3.connect(str(db_path))
         conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, content TEXT)")
         conn.execute("INSERT INTO docs VALUES (1, 'Python programming language')")
         conn.execute("INSERT INTO docs VALUES (2, 'JavaScript web development')")
         conn.commit()
+        conn.close()
 
         class MockBackend:
             backend_name = "mock"
@@ -196,8 +196,16 @@ class TestTableIndexDirectAPI:
             def embed_batch(self, texts):
                 return [self.embed(t) for t in texts]
 
+        # Create SQLiteBackend from path (will handle sqlite-vec loading)
+        backend = SQLiteBackend(str(db_path))
+
+        # Skip if sqlite-vec not loadable
+        if not backend.vector_available():
+            backend.close()
+            pytest.skip("sqlite-vec not available")
+
         index = TableIndex(
-            conn=conn,
+            db_backend=backend,
             table="docs",
             id_column="id",
             text_columns=["content"],
@@ -219,25 +227,24 @@ class TestTableIndexDirectAPI:
         results = index.search("python", mode="hybrid", limit=5)
         assert isinstance(results, list)
 
-        conn.close()
+        backend.close()
 
     def test_table_index_stats_with_vectors(self, tmp_path):
         """Test stats include vector counts."""
         db_path = tmp_path / "test.db"
 
-        conn = sqlite3.connect(str(db_path))
+        # Check if sqlite-vec is available
         try:
-            conn.enable_load_extension(True)
             import sqlite_vec
-
-            sqlite_vec.load(conn)
-        except Exception:
-            conn.close()
+        except ImportError:
             pytest.skip("sqlite-vec not available")
 
+        # Create table with data using temp connection
+        conn = sqlite3.connect(str(db_path))
         conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, content TEXT)")
         conn.execute("INSERT INTO docs VALUES (1, 'Test document')")
         conn.commit()
+        conn.close()
 
         class MockBackend:
             backend_name = "mock"
@@ -250,8 +257,16 @@ class TestTableIndexDirectAPI:
             def embed_batch(self, texts):
                 return [[0.1] * 8 for _ in texts]
 
+        # Create SQLiteBackend from path (will handle sqlite-vec loading)
+        backend = SQLiteBackend(str(db_path))
+
+        # Skip if sqlite-vec not loadable
+        if not backend.vector_available():
+            backend.close()
+            pytest.skip("sqlite-vec not available")
+
         index = TableIndex(
-            conn=conn,
+            db_backend=backend,
             table="docs",
             id_column="id",
             text_columns=["content"],
@@ -267,4 +282,4 @@ class TestTableIndexDirectAPI:
         assert "chunks_indexed" in stats
         assert "rows_with_vectors" in stats
 
-        conn.close()
+        backend.close()

@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 from local_esearch import Elasticsearch, TableIndex
+from local_esearch.backends.sqlite import SQLiteBackend
 
 
 class MockEmbeddingBackend:
@@ -25,9 +26,9 @@ class MockEmbeddingBackend:
 
 @pytest.fixture
 def db_with_table():
-    """Create an in-memory database with an existing table."""
-    conn = sqlite3.connect(":memory:")
-    conn.execute("""
+    """Create an in-memory database backend with an existing table."""
+    backend = SQLiteBackend(":memory:")
+    backend.executescript("""
         CREATE TABLE documents (
             id INTEGER PRIMARY KEY,
             title TEXT,
@@ -43,13 +44,13 @@ def db_with_table():
         (4, "Machine Learning", "Introduction to ML algorithms and neural networks", "data"),
         (5, "Web Development", "Building web apps with JavaScript and React", "web"),
     ]
-    conn.executemany(
+    backend.executemany(
         "INSERT INTO documents (id, title, content, category) VALUES (?, ?, ?, ?)",
         docs,
     )
-    conn.commit()
-    yield conn
-    conn.close()
+    backend.commit()
+    yield backend
+    backend.close()
 
 
 @pytest.fixture
@@ -102,7 +103,7 @@ class TestTableIndex:
     def test_setup_creates_fts_table(self, db_with_table):
         """Test that setup creates FTS5 table."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -110,15 +111,15 @@ class TestTableIndex:
         index.setup()
 
         # Check FTS table exists
-        cursor = db_with_table.execute(
+        rows = db_with_table.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts'"
         )
-        assert cursor.fetchone() is not None
+        assert len(rows) > 0
 
     def test_setup_creates_triggers(self, db_with_table):
         """Test that setup creates sync triggers."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -126,8 +127,8 @@ class TestTableIndex:
         index.setup()
 
         # Check triggers exist
-        cursor = db_with_table.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
-        triggers = [row[0] for row in cursor.fetchall()]
+        rows = db_with_table.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        triggers = [row["name"] for row in rows]
         assert "documents_fts_ai" in triggers
         assert "documents_fts_ad" in triggers
         assert "documents_fts_au" in triggers
@@ -135,7 +136,7 @@ class TestTableIndex:
     def test_reindex_populates_fts(self, db_with_table):
         """Test that reindex populates FTS5 table."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -148,7 +149,7 @@ class TestTableIndex:
     def test_keyword_search(self, db_with_table):
         """Test keyword search returns matching rows."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -166,7 +167,7 @@ class TestTableIndex:
     def test_search_with_limit(self, db_with_table):
         """Test search respects limit parameter."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -180,7 +181,7 @@ class TestTableIndex:
     def test_fts_sync_on_insert(self, db_with_table):
         """Test FTS5 updates automatically on insert."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -203,7 +204,7 @@ class TestTableIndex:
     def test_fts_sync_on_update(self, db_with_table):
         """Test FTS5 updates automatically on update."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -226,7 +227,7 @@ class TestTableIndex:
     def test_fts_sync_on_delete(self, db_with_table):
         """Test FTS5 updates automatically on delete."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -248,18 +249,13 @@ class TestTableIndex:
 
     def test_chunks_and_vec_cleanup_on_delete(self, db_with_table):
         """Test chunks and vector entries are deleted when parent row is deleted."""
-        # Enable sqlite-vec if available
-        try:
-            db_with_table.enable_load_extension(True)
-            import sqlite_vec
-
-            sqlite_vec.load(db_with_table)
-        except Exception:
+        # Check if sqlite-vec is available in the backend
+        if not db_with_table.vector_available():
             pytest.skip("sqlite-vec not available")
 
         backend = MockEmbeddingBackend()
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -271,17 +267,17 @@ class TestTableIndex:
         index.reindex()
 
         # Verify chunks exist for row 1
-        cursor = db_with_table.execute(
-            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (1,)
+        rows = db_with_table.execute(
+            "SELECT COUNT(*) as cnt FROM documents_chunks WHERE row_id = ?", (1,)
         )
-        chunks_before = cursor.fetchone()[0]
+        chunks_before = rows[0]["cnt"]
         assert chunks_before > 0, "Expected chunks for row 1"
 
         # Verify vector entries exist for row 1 (format: "row_id:chunk_idx")
-        cursor = db_with_table.execute(
-            "SELECT COUNT(*) FROM documents_vec WHERE chunk_id LIKE '1:%'"
+        rows = db_with_table.execute(
+            "SELECT COUNT(*) as cnt FROM documents_vec WHERE chunk_id LIKE '1:%'"
         )
-        vec_before = cursor.fetchone()[0]
+        vec_before = rows[0]["cnt"]
         assert vec_before > 0, "Expected vector entries for row 1"
 
         # Delete the parent row
@@ -289,30 +285,30 @@ class TestTableIndex:
         db_with_table.commit()
 
         # Verify chunks are gone
-        cursor = db_with_table.execute(
-            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (1,)
+        rows = db_with_table.execute(
+            "SELECT COUNT(*) as cnt FROM documents_chunks WHERE row_id = ?", (1,)
         )
-        chunks_after = cursor.fetchone()[0]
+        chunks_after = rows[0]["cnt"]
         assert chunks_after == 0, "Chunks should be deleted"
 
         # Verify vector entries are gone
-        cursor = db_with_table.execute(
-            "SELECT COUNT(*) FROM documents_vec WHERE chunk_id LIKE '1:%'"
+        rows = db_with_table.execute(
+            "SELECT COUNT(*) as cnt FROM documents_vec WHERE chunk_id LIKE '1:%'"
         )
-        vec_after = cursor.fetchone()[0]
+        vec_after = rows[0]["cnt"]
         assert vec_after == 0, "Vector entries should be deleted"
 
         # Verify other rows' data is still intact
-        cursor = db_with_table.execute(
-            "SELECT COUNT(*) FROM documents_chunks WHERE row_id = ?", (2,)
+        rows = db_with_table.execute(
+            "SELECT COUNT(*) as cnt FROM documents_chunks WHERE row_id = ?", (2,)
         )
-        other_chunks = cursor.fetchone()[0]
+        other_chunks = rows[0]["cnt"]
         assert other_chunks > 0, "Other rows should still have chunks"
 
     def test_stats(self, db_with_table):
         """Test stats returns correct counts."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -328,7 +324,7 @@ class TestTableIndex:
     def test_drop_removes_everything(self, db_with_table):
         """Test drop removes FTS table and triggers."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -338,16 +334,16 @@ class TestTableIndex:
         index.drop()
 
         # FTS table should be gone
-        cursor = db_with_table.execute(
+        rows = db_with_table.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts'"
         )
-        assert cursor.fetchone() is None
+        assert len(rows) == 0
 
         # Triggers should be gone
-        cursor = db_with_table.execute(
+        rows = db_with_table.execute(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'documents_fts%'"
         )
-        assert cursor.fetchall() == []
+        assert len(rows) == 0
 
 
 class TestElasticsearchWithTable:
@@ -427,7 +423,7 @@ class TestEmbeddingText:
     def test_embedding_text_as_column_name(self, db_with_table):
         """Test using a column name for embedding text."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -441,7 +437,7 @@ class TestEmbeddingText:
     def test_embedding_text_as_callable(self, db_with_table):
         """Test using a callable for embedding text."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -455,7 +451,7 @@ class TestEmbeddingText:
     def test_embedding_text_default_concatenation(self, db_with_table):
         """Test default concatenation of text columns."""
         index = TableIndex(
-            conn=db_with_table,
+            db_backend=db_with_table,
             table="documents",
             id_column="id",
             text_columns=["title", "content"],
@@ -547,19 +543,19 @@ class TestPersistence:
         es.register_table(index="docs", table="docs", text_columns=["text"])
 
         # Verify FTS table exists
-        cursor = es._conn.execute(
+        rows = es._backend.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_fts'"
         )
-        assert cursor.fetchone() is not None
+        assert len(rows) > 0
 
         # Unregister with drop
         es.unregister_table("docs", drop_indexes=True)
 
         # FTS table should be gone
-        cursor = es._conn.execute(
+        rows = es._backend.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='docs_fts'"
         )
-        assert cursor.fetchone() is None
+        assert len(rows) == 0
 
         es.close()
 
@@ -584,3 +580,137 @@ class TestPersistence:
         assert "users" in es2._table_indexes
         assert "posts" in es2._table_indexes
         es2.close()
+
+
+class TestMultiTableSearch:
+    """Test searching across multiple registered tables."""
+
+    @pytest.fixture
+    def es_multi_table(self, tmp_path):
+        """Create ES client with multiple registered tables."""
+        db_path = tmp_path / "test.db"
+
+        conn = sqlite3.connect(str(db_path))
+        # Create emails table
+        conn.execute("""
+            CREATE TABLE emails (
+                id INTEGER PRIMARY KEY,
+                subject TEXT,
+                body TEXT
+            )
+        """)
+        conn.executemany(
+            "INSERT INTO emails (id, subject, body) VALUES (?, ?, ?)",
+            [
+                (1, "Meeting about Python project", "Let's discuss the Python implementation"),
+                (2, "JavaScript review", "Please review the JS code changes"),
+                (3, "Quarterly report", "Attached is the quarterly financial report"),
+            ],
+        )
+        # Create sessions table
+        conn.execute("""
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY,
+                project TEXT,
+                summary TEXT
+            )
+        """)
+        conn.executemany(
+            "INSERT INTO sessions (id, project, summary) VALUES (?, ?, ?)",
+            [
+                (1, "api-server", "Fixed Python async bug in the API"),
+                (2, "web-app", "Implemented JavaScript animations"),
+                (3, "data-pipeline", "Python data processing optimization"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        es = Elasticsearch(path=str(db_path))
+        es.register_table(
+            index="emails",
+            table="emails",
+            text_columns=["subject", "body"],
+        )
+        es.register_table(
+            index="sessions",
+            table="sessions",
+            text_columns=["project", "summary"],
+        )
+        es.indices.reindex("emails")
+        es.indices.reindex("sessions")
+
+        yield es
+        es.close()
+
+    def test_search_multiple_registered_tables(self, es_multi_table):
+        """Test searching across multiple registered tables."""
+        response = es_multi_table.search(
+            index=["emails", "sessions"],
+            q="python",
+        )
+
+        # Should find results from both tables
+        hits = response["hits"]["hits"]
+        assert len(hits) >= 2
+
+        indices_found = {h["_index"] for h in hits}
+        assert "emails" in indices_found
+        assert "sessions" in indices_found
+
+    def test_search_single_registered_table(self, es_multi_table):
+        """Test searching a single registered table still works."""
+        response = es_multi_table.search(index="emails", q="python")
+
+        hits = response["hits"]["hits"]
+        assert len(hits) >= 1
+        assert all(h["_index"] == "emails" for h in hits)
+
+    def test_search_all_indices_includes_registered_tables(self, es_multi_table):
+        """Test that searching with no index includes registered tables."""
+        # Also add a regular index document
+        es_multi_table.index(
+            index="docs",
+            id="1",
+            document={"title": "Python guide", "content": "Learn Python basics"},
+        )
+
+        response = es_multi_table.search(q="python")
+
+        hits = response["hits"]["hits"]
+        indices_found = {h["_index"] for h in hits}
+
+        # Should find results from registered tables and regular index
+        assert "emails" in indices_found or "sessions" in indices_found
+        assert "docs" in indices_found
+
+    def test_search_mixed_indices(self, es_multi_table):
+        """Test searching mix of registered tables and regular indices."""
+        # Add a regular index document
+        es_multi_table.index(
+            index="docs",
+            id="1",
+            document={"title": "Python tutorial"},
+        )
+
+        response = es_multi_table.search(
+            index=["emails", "docs"],
+            q="python",
+        )
+
+        hits = response["hits"]["hits"]
+        indices_found = {h["_index"] for h in hits}
+
+        assert "emails" in indices_found
+        assert "docs" in indices_found
+
+    def test_multi_table_total_count(self, es_multi_table):
+        """Test that total count includes results from all tables."""
+        response = es_multi_table.search(
+            index=["emails", "sessions"],
+            q="python",
+        )
+
+        # Total should reflect documents from both tables
+        total = response["hits"]["total"]["value"]
+        assert total >= 2  # At least 1 from emails + 2 from sessions

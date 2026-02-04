@@ -1,16 +1,62 @@
-"""SQLite schema management for local_esearch."""
+"""SQLite schema management for local_esearch.
+
+This module provides backward compatibility. The actual implementation
+has moved to the backends module.
+"""
 
 from __future__ import annotations
 
 import sqlite3
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from local_esearch.embeddings.base import EmbeddingBackend
 
 
 SCHEMA_VERSION = 2
+
+
+def extract_text_fields(source: dict[str, Any], mappings: dict | None = None) -> str:
+    """Extract text from document for FTS indexing.
+
+    Concatenates all string fields (recursively) into a single text blob.
+    If mappings specify text fields, only those are extracted.
+    """
+    if mappings and "properties" in mappings:
+        text_fields = []
+        for field, config in mappings["properties"].items():
+            if config.get("type") == "text" and field in source:
+                value = source[field]
+                if isinstance(value, str):
+                    text_fields.append(value)
+        return " ".join(text_fields)
+
+    texts: list[str] = []
+
+    def extract(obj: Any) -> None:
+        if isinstance(obj, str):
+            texts.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                extract(item)
+
+    extract(source)
+    return " ".join(texts)
+
+
+def vector_schema(dimensions: int) -> str:
+    """Generate vector table schema for given dimensions."""
+    return f"""
+CREATE VIRTUAL TABLE IF NOT EXISTS _documents_vec USING vec0(
+    doc_key TEXT PRIMARY KEY,
+    embedding float[{dimensions}]
+);
+"""
+
 
 # Core schema - always created
 CORE_SCHEMA = """
@@ -83,20 +129,9 @@ END;
 """
 
 
-def vector_schema(dimensions: int) -> str:
-    """Generate vector table schema for given dimensions."""
-    return f"""
--- Vector embeddings table (sqlite-vec)
-CREATE VIRTUAL TABLE IF NOT EXISTS _documents_vec USING vec0(
-    doc_key TEXT PRIMARY KEY,
-    embedding float[{dimensions}]
-);
-"""
-
-
 def init_database(
     conn: sqlite3.Connection,
-    embedding_backend: EmbeddingBackend | None = None,
+    embedding_backend: "EmbeddingBackend | None" = None,
 ) -> None:
     """Initialize database schema.
 
@@ -107,7 +142,9 @@ def init_database(
     cursor = conn.cursor()
 
     # Check current schema version
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_version'")
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_version'"
+    )
     if cursor.fetchone():
         cursor.execute("SELECT MAX(version) FROM _schema_version")
         row = cursor.fetchone()
@@ -160,7 +197,9 @@ def ensure_vector_table(
         return False
 
     # Check if table exists
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_documents_vec'")
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_documents_vec'"
+    )
     if cursor.fetchone():
         return True
 
@@ -171,36 +210,3 @@ def ensure_vector_table(
         return True
     except sqlite3.OperationalError:
         return False
-
-
-def extract_text_fields(source: dict, mappings: dict | None = None) -> str:
-    """Extract text from document for FTS indexing.
-
-    Concatenates all string fields (recursively) into a single text blob.
-    If mappings specify text fields, only those are extracted.
-    """
-    if mappings and "properties" in mappings:
-        # Use mapping to find text fields
-        text_fields = []
-        for field, config in mappings["properties"].items():
-            if config.get("type") == "text" and field in source:
-                value = source[field]
-                if isinstance(value, str):
-                    text_fields.append(value)
-        return " ".join(text_fields)
-
-    # Default: extract all string values recursively
-    texts = []
-
-    def extract(obj):
-        if isinstance(obj, str):
-            texts.append(obj)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                extract(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                extract(item)
-
-    extract(source)
-    return " ".join(texts)

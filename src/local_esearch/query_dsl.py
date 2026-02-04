@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from local_esearch.backends import DatabaseBackend
 
 
 @dataclass
@@ -12,7 +15,7 @@ class CompiledQuery:
 
     where_clause: str = ""
     params: list[Any] = field(default_factory=list)
-    fts_query: str | None = None  # For FTS5 MATCH
+    fts_query: str | None = None  # For FTS MATCH
     uses_fts: bool = False
     order_by: str | None = None
 
@@ -22,6 +25,14 @@ class QueryCompiler:
 
     Supports: match, match_phrase, match_all, term, terms, range, bool, exists
     """
+
+    def __init__(self, backend: "DatabaseBackend | None" = None):
+        """Initialize query compiler.
+
+        Args:
+            backend: Database backend for SQL dialect (optional for backward compat)
+        """
+        self._backend = backend
 
     def compile(self, query: dict[str, Any], index: str | None = None) -> CompiledQuery:
         """Compile an ES query dict to SQL components."""
@@ -79,7 +90,7 @@ class QueryCompiler:
         return CompiledQuery()
 
     def _compile_match(self, body: dict[str, Any]) -> CompiledQuery:
-        """Compile match query to FTS5."""
+        """Compile match query to FTS."""
         # body is {field: value} or {field: {query: value, ...}}
         field_name = next(iter(body.keys()))
         field_value = body[field_name]
@@ -92,19 +103,19 @@ class QueryCompiler:
         if not query_text:
             return CompiledQuery()
 
-        # Convert to FTS5 query - simple word matching
-        # FTS5 uses implicit OR between terms by default
+        # Convert to FTS query - simple word matching
         fts_terms = self._sanitize_fts_query(query_text)
 
+        # FTS matching is handled by document_fts_search_sql, not where_clause
         return CompiledQuery(
-            where_clause="rowid IN (SELECT rowid FROM _documents_fts WHERE _documents_fts MATCH ?)",
-            params=[fts_terms],
+            where_clause="",
+            params=[],
             fts_query=fts_terms,
             uses_fts=True,
         )
 
     def _compile_match_phrase(self, body: dict[str, Any]) -> CompiledQuery:
-        """Compile match_phrase query to FTS5 phrase search."""
+        """Compile match_phrase query to FTS phrase search."""
         field_name = next(iter(body.keys()))
         field_value = body[field_name]
 
@@ -116,12 +127,13 @@ class QueryCompiler:
         if not query_text:
             return CompiledQuery()
 
-        # FTS5 phrase query - wrap in double quotes
+        # FTS phrase query - wrap in double quotes
         fts_query = f'"{self._sanitize_fts_query(query_text)}"'
 
+        # FTS matching is handled by document_fts_search_sql, not where_clause
         return CompiledQuery(
-            where_clause="rowid IN (SELECT rowid FROM _documents_fts WHERE _documents_fts MATCH ?)",
-            params=[fts_query],
+            where_clause="",
+            params=[],
             fts_query=fts_query,
             uses_fts=True,
         )
@@ -138,8 +150,9 @@ class QueryCompiler:
 
         # Use JSON extract for field access
         json_path = self._field_to_json_path(field_name)
+        json_extract = self._json_extract_sql()
         return CompiledQuery(
-            where_clause="json_extract(_source, ?) = ?",
+            where_clause=f"{json_extract} = ?",
             params=[json_path, value],
         )
 
@@ -152,9 +165,10 @@ class QueryCompiler:
             return CompiledQuery(where_clause="1=0")  # Match nothing
 
         json_path = self._field_to_json_path(field_name)
-        placeholders = ",".join("?" for _ in values)
+        json_extract = self._json_extract_sql()
+        placeholders = self._placeholders(len(values))
         return CompiledQuery(
-            where_clause=f"json_extract(_source, ?) IN ({placeholders})",
+            where_clause=f"{json_extract} IN ({placeholders})",
             params=[json_path] + list(values),
         )
 
@@ -164,21 +178,22 @@ class QueryCompiler:
         conditions = body[field_name]
 
         json_path = self._field_to_json_path(field_name)
+        json_extract = self._json_extract_sql()
         clauses = []
         params = []
 
         for op, value in conditions.items():
             if op == "gt":
-                clauses.append("json_extract(_source, ?) > ?")
+                clauses.append(f"{json_extract} > ?")
                 params.extend([json_path, value])
             elif op == "gte":
-                clauses.append("json_extract(_source, ?) >= ?")
+                clauses.append(f"{json_extract} >= ?")
                 params.extend([json_path, value])
             elif op == "lt":
-                clauses.append("json_extract(_source, ?) < ?")
+                clauses.append(f"{json_extract} < ?")
                 params.extend([json_path, value])
             elif op == "lte":
-                clauses.append("json_extract(_source, ?) <= ?")
+                clauses.append(f"{json_extract} <= ?")
                 params.extend([json_path, value])
 
         if not clauses:
@@ -208,7 +223,7 @@ class QueryCompiler:
             filter_clauses = [filter_clauses]
 
         all_clauses = []
-        all_params = []
+        all_params: list[Any] = []
         uses_fts = False
         fts_queries = []
 
@@ -275,8 +290,9 @@ class QueryCompiler:
             return CompiledQuery()
 
         json_path = self._field_to_json_path(field_name)
+        json_extract = self._json_extract_sql()
         return CompiledQuery(
-            where_clause="json_extract(_source, ?) IS NOT NULL",
+            where_clause=f"{json_extract} IS NOT NULL",
             params=[json_path],
         )
 
@@ -286,7 +302,7 @@ class QueryCompiler:
         if not values:
             return CompiledQuery(where_clause="1=0")
 
-        placeholders = ",".join("?" for _ in values)
+        placeholders = self._placeholders(len(values))
         return CompiledQuery(
             where_clause=f"_id IN ({placeholders})",
             params=list(values),
@@ -303,8 +319,9 @@ class QueryCompiler:
             value = str(field_value)
 
         json_path = self._field_to_json_path(field_name)
+        json_extract = self._json_extract_sql()
         return CompiledQuery(
-            where_clause="json_extract(_source, ?) LIKE ?",
+            where_clause=f"{json_extract} LIKE ?",
             params=[json_path, f"{value}%"],
         )
 
@@ -324,26 +341,44 @@ class QueryCompiler:
         sql_pattern = value.replace("*", "%").replace("?", "_")
 
         json_path = self._field_to_json_path(field_name)
+        json_extract = self._json_extract_sql()
         return CompiledQuery(
-            where_clause="json_extract(_source, ?) LIKE ?",
+            where_clause=f"{json_extract} LIKE ?",
             params=[json_path, sql_pattern],
         )
 
     def _field_to_json_path(self, field: str) -> str:
         """Convert ES field name to JSON path.
 
-        Examples:
-            'title' -> '$.title'
-            'author.name' -> '$.author.name'
+        Uses backend if available for database-specific path format.
+        SQLite: '$.title'
+        PostgreSQL: 'title'
         """
+        if self._backend:
+            return self._backend.json_path(field)
         return f"$.{field}"
 
-    def _sanitize_fts_query(self, query: str) -> str:
-        """Sanitize query string for FTS5.
+    def _json_extract_sql(self) -> str:
+        """Return SQL fragment for JSON extraction.
 
-        Removes special FTS5 operators that could cause syntax errors.
+        Uses backend if available, otherwise defaults to SQLite syntax.
         """
-        # Remove FTS5 special characters
+        if self._backend:
+            return self._backend.json_extract("_source")
+        return "json_extract(_source, ?)"
+
+    def _placeholders(self, n: int) -> str:
+        """Return n placeholders comma-separated."""
+        if self._backend:
+            return self._backend.placeholders(n)
+        return ", ".join("?" for _ in range(n))
+
+    def _sanitize_fts_query(self, query: str) -> str:
+        """Sanitize query string for FTS.
+
+        Removes special FTS operators that could cause syntax errors.
+        """
+        # Remove FTS special characters
         for char in ['"', "'", "(", ")", "*", ":", "^", "-", "+", "OR", "AND", "NOT", "NEAR"]:
             query = query.replace(char, " ")
         # Collapse whitespace

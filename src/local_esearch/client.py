@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
+from local_esearch.backends import DatabaseBackend, create_backend
 from local_esearch.embeddings import get_backend
 from local_esearch.embeddings.base import EmbeddingBackend
 from local_esearch.exceptions import ConflictError, NotFoundError, RequestError
@@ -24,17 +24,52 @@ from local_esearch.response import (
     format_search_response,
     format_update_response,
 )
-from local_esearch.schema import ensure_vector_table, extract_text_fields, init_database
 from local_esearch.table_index import TableIndex
 
 
+def _extract_text_fields(source: dict, mappings: dict | None = None) -> str:
+    """Extract text from document for FTS indexing.
+
+    Concatenates all string fields (recursively) into a single text blob.
+    If mappings specify text fields, only those are extracted.
+    """
+    if mappings and "properties" in mappings:
+        text_fields = []
+        for field, config in mappings["properties"].items():
+            if config.get("type") == "text" and field in source:
+                value = source[field]
+                if isinstance(value, str):
+                    text_fields.append(value)
+        return " ".join(text_fields)
+
+    texts: list[str] = []
+
+    def extract(obj: Any) -> None:
+        if isinstance(obj, str):
+            texts.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                extract(item)
+
+    extract(source)
+    return " ".join(texts)
+
+
 class Elasticsearch:
-    """Elasticsearch-compatible client backed by SQLite + FTS5 + sqlite-vec.
+    """Elasticsearch-compatible client backed by SQLite/PostgreSQL + FTS + vectors.
 
     Provides a drop-in replacement for elasticsearch-py in local/embedded use cases.
 
     Example:
+        # SQLite (default)
         es = Elasticsearch(path="./search.db")
+
+        # PostgreSQL
+        es = Elasticsearch(path="postgresql://user:pass@localhost/dbname")
+
         es.index(index="docs", id="1", document={"title": "Hello", "body": "World"})
         response = es.search(index="docs", body={"query": {"match": {"body": "world"}}})
     """
@@ -47,40 +82,41 @@ class Elasticsearch:
         """Initialize Elasticsearch client.
 
         Args:
-            path: SQLite database path or ":memory:" for in-memory
+            path: Database path. Can be:
+                - SQLite file path (e.g., "./search.db")
+                - ":memory:" for in-memory SQLite
+                - PostgreSQL URI (e.g., "postgresql://user:pass@localhost/dbname")
             embedding_backend: Embedding backend name ("voyage", "gemini", "openai")
                               or EmbeddingBackend instance, or None for keyword-only
         """
         self._path = str(path)
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-
-        # Enable foreign keys and WAL mode for better performance
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        if self._path != ":memory:":
-            self._conn.execute("PRAGMA journal_mode = WAL")
 
         # Initialize embedding backend
         if isinstance(embedding_backend, str):
-            self._embedding_backend = get_backend(embedding_backend)
+            self._embedding_backend: EmbeddingBackend | None = get_backend(
+                embedding_backend
+            )
         else:
             self._embedding_backend = embedding_backend
 
-        # Try to load sqlite-vec if available
-        self._has_vec = self._load_sqlite_vec()
+        # Create database backend
+        self._backend: DatabaseBackend = create_backend(path, self._embedding_backend)
 
         # Initialize schema
-        init_database(self._conn, self._embedding_backend)
+        vector_dims = (
+            self._embedding_backend.dimensions if self._embedding_backend else None
+        )
+        self._backend.init_schema(vector_dims)
 
         # Ensure vector table exists if we have an embedding backend
-        if self._embedding_backend and self._has_vec:
-            ensure_vector_table(self._conn, self._embedding_backend.dimensions)
+        if self._embedding_backend and self._backend.vector_available():
+            self._backend.create_documents_vec_table(self._embedding_backend.dimensions)
 
         # Sub-clients
         self.indices = IndicesClient(self)
 
         # Query compiler
-        self._query_compiler = QueryCompiler()
+        self._query_compiler = QueryCompiler(self._backend)
 
         # Registry for table indexes (bolt-on search over existing tables)
         self._table_indexes: dict[str, TableIndex] = {}
@@ -88,26 +124,14 @@ class Elasticsearch:
         # Auto-load any previously registered table indexes
         self._load_table_indexes()
 
-    def _load_sqlite_vec(self) -> bool:
-        """Try to load sqlite-vec extension."""
-        try:
-            import sqlite_vec
-
-            self._conn.enable_load_extension(True)
-            sqlite_vec.load(self._conn)
-            self._conn.enable_load_extension(False)
-            return True
-        except (ImportError, Exception):
-            return False
-
     def close(self) -> None:
         """Close the database connection."""
-        self._conn.close()
+        self._backend.close()
 
     def __enter__(self) -> Elasticsearch:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
     # -------------------------------------------------------------------------
@@ -127,12 +151,12 @@ class Elasticsearch:
     ) -> TableIndex:
         """Register an existing table for search.
 
-        Creates FTS5 and vector indexes over an existing SQLite table,
+        Creates FTS and vector indexes over an existing table,
         enabling search without duplicating data.
 
         Args:
             index: ES index name to use for this table
-            table: Actual SQLite table name
+            table: Actual table name
             id_column: Primary key column name
             text_columns: Columns to include in full-text search
             embedding_text: How to generate text for embeddings:
@@ -140,7 +164,7 @@ class Elasticsearch:
                 - Callable: function(row_dict) -> str
                 - None: concatenate all text_columns
             embedding_backend: Backend name or instance (overrides client default)
-            setup: Auto-create FTS5 table and triggers
+            setup: Auto-create FTS table and triggers
 
         Returns:
             TableIndex instance for further configuration
@@ -165,7 +189,7 @@ class Elasticsearch:
 
         # Create table index
         table_index = TableIndex(
-            conn=self._conn,
+            db_backend=self._backend,
             table=table,
             id_column=id_column,
             text_columns=text_columns or [],
@@ -202,22 +226,26 @@ class Elasticsearch:
 
     def _load_table_indexes(self) -> None:
         """Load previously registered table indexes from metadata."""
-        cursor = self._conn.cursor()
         try:
-            cursor.execute("""
+            rows = self._backend.execute("""
                 SELECT index_name, table_name, id_column, text_columns_json,
                        embedding_text, embedding_backend
                 FROM _table_indexes
             """)
-        except sqlite3.OperationalError:
+        except Exception:
             # Table doesn't exist yet (old schema)
             return
 
-        for row in cursor.fetchall():
-            index_name, table_name, id_column, text_cols_json, emb_text, emb_backend = row
+        for row in rows:
+            index_name = row["index_name"]
+            table_name = row["table_name"]
+            id_column = row["id_column"]
+            text_cols_json = row["text_columns_json"]
+            emb_text = row["embedding_text"]
+            emb_backend = row["embedding_backend"]
 
-            # Parse text columns
-            text_columns = json.loads(text_cols_json) if text_cols_json else []
+            # Parse text columns (PostgreSQL JSONB returns list directly, SQLite returns JSON string)
+            text_columns = text_cols_json if isinstance(text_cols_json, list) else (json.loads(text_cols_json) if text_cols_json else [])
 
             # Resolve embedding backend
             if emb_backend:
@@ -225,13 +253,13 @@ class Elasticsearch:
             else:
                 backend = self._embedding_backend
 
-            # Recreate TableIndex (FTS5 tables and triggers already exist)
+            # Recreate TableIndex (FTS tables and triggers already exist)
             table_index = TableIndex(
-                conn=self._conn,
+                db_backend=self._backend,
                 table=table_name,
                 id_column=id_column,
                 text_columns=text_columns,
-                embedding_text=emb_text,  # Note: callable not supported for persistence
+                embedding_text=emb_text,
                 embedding_backend=backend,
             )
             # Don't call setup() - tables already exist
@@ -247,32 +275,23 @@ class Elasticsearch:
         embedding_backend: str | None,
     ) -> None:
         """Persist table index registration to metadata."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO _table_indexes
-                (index_name, table_name, id_column, text_columns_json,
-                 embedding_text, embedding_backend, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                index,
-                table,
-                id_column,
-                json.dumps(text_columns),
-                embedding_text if isinstance(embedding_text, str) else None,
-                embedding_backend,
-                time.time(),
-            ),
+        self._backend.upsert_table_registration(
+            index=index,
+            table=table,
+            id_column=id_column,
+            text_columns_json=json.dumps(text_columns),
+            embedding_text=embedding_text if isinstance(embedding_text, str) else None,
+            embedding_backend=embedding_backend,
+            created_at=self._backend.timestamp_now(),
         )
-        self._conn.commit()
+        self._backend.commit()
 
     def unregister_table(self, index: str, *, drop_indexes: bool = False) -> bool:
         """Unregister a table index.
 
         Args:
             index: ES index name to unregister
-            drop_indexes: Also drop the FTS5 and vector tables
+            drop_indexes: Also drop the FTS and vector tables
 
         Returns:
             True if index was registered, False otherwise
@@ -282,11 +301,12 @@ class Elasticsearch:
             return False
 
         # Remove from metadata
-        cursor = self._conn.cursor()
-        cursor.execute("DELETE FROM _table_indexes WHERE index_name = ?", (index,))
-        self._conn.commit()
+        self._backend.execute(
+            "DELETE FROM _table_indexes WHERE index_name = ?", (index,)
+        )
+        self._backend.commit()
 
-        # Optionally drop the FTS5/vector tables
+        # Optionally drop the FTS/vector tables
         if drop_indexes:
             table_index.drop()
 
@@ -329,25 +349,26 @@ class Elasticsearch:
         mappings = self._get_index_mappings(index)
 
         # Extract text for FTS
-        text = extract_text_fields(doc, mappings)
+        text = _extract_text_fields(doc, mappings)
 
-        cursor = self._conn.cursor()
-        now = time.time()
+        now = self._backend.timestamp_now()
 
         # Check if document exists
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT _version FROM _documents WHERE _index = ? AND _id = ?",
             (index, doc_id),
         )
-        existing = cursor.fetchone()
+        existing = rows[0] if rows else None
 
         if existing:
             if op_type == "create":
-                raise ConflictError(f"Document '{doc_id}' already exists in index '{index}'")
+                raise ConflictError(
+                    f"Document '{doc_id}' already exists in index '{index}'"
+                )
 
             # Update existing document
-            new_version = existing[0] + 1
-            cursor.execute(
+            new_version = existing["_version"] + 1
+            self._backend.execute(
                 """
                 UPDATE _documents
                 SET _source = ?, _text = ?, _version = ?, updated_at = ?
@@ -359,7 +380,7 @@ class Elasticsearch:
         else:
             # Insert new document
             new_version = 1
-            cursor.execute(
+            self._backend.execute(
                 """
                 INSERT INTO _documents
                     (_index, _id, _source, _text, _version, created_at, updated_at)
@@ -370,13 +391,14 @@ class Elasticsearch:
             result = "created"
 
         # Update vector embedding if backend available
-        if self._embedding_backend and self._has_vec and text:
+        if (
+            self._embedding_backend
+            and self._backend.vector_available()
+            and text
+        ):
             self._update_embedding(index, doc_id, text)
 
-        if refresh:
-            self._conn.commit()
-        else:
-            self._conn.commit()
+        self._backend.commit()
 
         return format_index_response(index, doc_id, new_version, result)
 
@@ -400,21 +422,21 @@ class Elasticsearch:
         Raises:
             NotFoundError: If document not found
         """
-        cursor = self._conn.cursor()
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT _source, _version FROM _documents WHERE _index = ? AND _id = ?",
             (index, id),
         )
-        row = cursor.fetchone()
 
-        if not row:
+        if not rows:
             raise NotFoundError(
                 f"Document '{id}' not found in index '{index}'",
                 body={"_index": index, "_id": id, "found": False},
             )
 
-        source = json.loads(row[0])
-        version = row[1]
+        row = rows[0]
+        # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+        source = row["_source"] if isinstance(row["_source"], dict) else json.loads(row["_source"])
+        version = row["_version"]
 
         # Filter source fields if specified
         if isinstance(_source, list):
@@ -434,12 +456,11 @@ class Elasticsearch:
         Returns:
             True if document exists
         """
-        cursor = self._conn.cursor()
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT 1 FROM _documents WHERE _index = ? AND _id = ?",
             (index, id),
         )
-        return cursor.fetchone() is not None
+        return len(rows) > 0
 
     def delete(
         self,
@@ -461,36 +482,27 @@ class Elasticsearch:
         Raises:
             NotFoundError: If document not found
         """
-        cursor = self._conn.cursor()
-
         # Get version before delete
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT _version FROM _documents WHERE _index = ? AND _id = ?",
             (index, id),
         )
-        row = cursor.fetchone()
-        if not row:
+        if not rows:
             raise NotFoundError(f"Document '{id}' not found in index '{index}'")
 
-        version = row[0]
+        version = rows[0]["_version"]
 
         # Delete document
-        cursor.execute(
+        self._backend.execute(
             "DELETE FROM _documents WHERE _index = ? AND _id = ?",
             (index, id),
         )
 
         # Delete vector embedding if exists
-        if self._has_vec:
-            try:
-                cursor.execute(
-                    "DELETE FROM _documents_vec WHERE doc_key = ?",
-                    (f"{index}:{id}",),
-                )
-            except sqlite3.OperationalError:
-                pass
+        if self._backend.vector_available():
+            self._backend.vector_delete("_documents_vec", f"{index}:{id}")
 
-        self._conn.commit()
+        self._backend.commit()
 
         return format_delete_response(index, id, version)
 
@@ -528,29 +540,29 @@ class Elasticsearch:
             raise RequestError("Missing 'doc' in update body")
 
         # Get existing document
-        cursor = self._conn.cursor()
-        cursor.execute(
+        rows = self._backend.execute(
             "SELECT _source, _version FROM _documents WHERE _index = ? AND _id = ?",
             (index, id),
         )
-        row = cursor.fetchone()
-        if not row:
+        if not rows:
             raise NotFoundError(f"Document '{id}' not found in index '{index}'")
 
-        existing_source = json.loads(row[0])
-        version = row[1]
+        row = rows[0]
+        # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+        existing_source = row["_source"] if isinstance(row["_source"], dict) else json.loads(row["_source"])
+        version = row["_version"]
 
         # Merge documents
         existing_source.update(doc)
 
         # Get mappings for text extraction
         mappings = self._get_index_mappings(index)
-        text = extract_text_fields(existing_source, mappings)
+        text = _extract_text_fields(existing_source, mappings)
 
         # Update
         new_version = version + 1
-        now = time.time()
-        cursor.execute(
+        now = self._backend.timestamp_now()
+        self._backend.execute(
             """
             UPDATE _documents
             SET _source = ?, _text = ?, _version = ?, updated_at = ?
@@ -560,10 +572,14 @@ class Elasticsearch:
         )
 
         # Update vector embedding
-        if self._embedding_backend and self._has_vec and text:
+        if (
+            self._embedding_backend
+            and self._backend.vector_available()
+            and text
+        ):
             self._update_embedding(index, id, text)
 
-        self._conn.commit()
+        self._backend.commit()
 
         return format_update_response(index, id, new_version)
 
@@ -632,31 +648,19 @@ class Elasticsearch:
         """Search for documents.
 
         Args:
-            index: Index name(s) to search
+            index: Index name(s) to search. Can mix registered tables and regular indices.
             body: Search body with "query" key
             q: Simple query string (alternative to body)
             size: Maximum results to return
             from_: Offset for pagination
             sort: Sort specification
             _source: Source filtering
-            mode: Search mode - "keyword" (FTS5), "semantic" (vector), "hybrid" (RRF fusion)
+            mode: Search mode - "keyword" (FTS), "semantic" (vector), "hybrid" (RRF fusion)
 
         Returns:
             Search response with hits
         """
         start_time = time.time()
-
-        # Check if this is a registered table index
-        if isinstance(index, str) and index in self._table_indexes:
-            return self._search_table_index(
-                index=index,
-                body=body,
-                q=q,
-                size=size,
-                from_=from_,
-                mode=mode,
-                start_time=start_time,
-            )
 
         # Normalize index to list
         if isinstance(index, str):
@@ -666,8 +670,22 @@ class Elasticsearch:
         else:
             indices = None  # Search all
 
+        # Categorize indices into registered tables vs regular indices
+        registered_indices = []
+        regular_indices = []
+        if indices:
+            for idx in indices:
+                if idx in self._table_indexes:
+                    registered_indices.append(idx)
+                else:
+                    regular_indices.append(idx)
+        else:
+            # Search all: include all registered tables + regular indices
+            registered_indices = list(self._table_indexes.keys())
+            regular_indices = None  # Will search all regular indices
+
         # Build query from body or q parameter
-        query = {}
+        query: dict[str, Any] = {}
         if body:
             query = body.get("query", {})
             size = body.get("size", size)
@@ -679,45 +697,93 @@ class Elasticsearch:
             # Simple query string - search all text fields
             query = {"match": {"_text": q}}
 
+        # Extract query text for semantic/table searches
+        query_text = self._extract_query_text(query, q)
+
         # Determine search mode
-        use_semantic = mode in ("semantic", "hybrid") and self._embedding_backend and self._has_vec
+        use_semantic = (
+            mode in ("semantic", "hybrid")
+            and self._embedding_backend
+            and self._backend.vector_available()
+        )
         use_keyword = mode in ("keyword", "hybrid")
 
-        keyword_results = []
-        vector_results = []
+        keyword_results: list[tuple[str, Any, dict, float]] = []
+        vector_results: list[tuple[str, Any, dict, float]] = []
+        inner_hits_map: dict[tuple[str, Any], list[dict]] = {}
 
-        if use_keyword:
-            keyword_results = self._keyword_search(query, indices, size=size + from_)
+        # Search registered tables
+        if registered_indices and query_text:
+            for idx in registered_indices:
+                table_index = self._table_indexes[idx]
+                kw, vec, inner_hits = table_index.search_raw(
+                    query_text,
+                    mode=mode,
+                    limit=size + from_,
+                    index_name=idx,
+                )
+                keyword_results.extend(kw)
+                vector_results.extend(vec)
+                for doc_id, chunks in inner_hits.items():
+                    inner_hits_map[(idx, doc_id)] = chunks
 
-        if use_semantic:
-            # Extract query text for embedding
-            query_text = self._extract_query_text(query, q)
-            if query_text:
-                vector_results = self._vector_search(query_text, indices, size=size + from_)
+        # Search regular indices
+        has_regular = regular_indices is None or len(regular_indices) > 0
+        if has_regular:
+            if use_keyword:
+                kw = self._keyword_search(query, regular_indices, size=size + from_)
+                keyword_results.extend(kw)
 
-        # Get total count for the query (independent of size/pagination)
-        total = self._count_matches(query, indices)
+            if use_semantic and query_text:
+                vec = self._vector_search(query_text, regular_indices, size=size + from_)
+                vector_results.extend(vec)
 
-        # Combine results
+        # Get total count
+        total = 0
+        if has_regular:
+            total += self._count_matches(query, regular_indices)
+        if registered_indices:
+            seen_docs: set[tuple[str, Any]] = set()
+            for idx, doc_id, _, _ in keyword_results:
+                if idx in self._table_indexes:
+                    seen_docs.add((idx, doc_id))
+            for idx, doc_id, _, _ in vector_results:
+                if idx in self._table_indexes:
+                    seen_docs.add((idx, doc_id))
+            total += len(seen_docs)
+
+        # Combine results with RRF fusion
         if mode == "hybrid" and keyword_results and vector_results:
             fused = reciprocal_rank_fusion(keyword_results, vector_results)
-            # Convert to hit format
             hits = []
             for doc in fused[from_ : from_ + size]:
-                hit = format_hit(doc.index, doc.doc_id, doc.source, score=doc.fused_score)
+                source = doc.source.copy() if doc.source else {}
+                if doc.index in self._table_indexes:
+                    source["_table_row_id"] = doc.doc_id
+                hit = format_hit(doc.index, str(doc.doc_id), source, score=doc.fused_score)
+                if (doc.index, doc.doc_id) in inner_hits_map:
+                    hit["inner_hits"] = {"chunks": inner_hits_map[(doc.index, doc.doc_id)]}
                 hits.append(hit)
             max_score = fused[0].fused_score if fused else None
         elif vector_results and mode == "semantic":
             hits = []
             for idx, doc_id, source, score in vector_results[from_ : from_ + size]:
-                hit = format_hit(idx, doc_id, source, score=score)
+                source = source.copy() if source else {}
+                if idx in self._table_indexes:
+                    source["_table_row_id"] = doc_id
+                hit = format_hit(idx, str(doc_id), source, score=score)
+                if (idx, doc_id) in inner_hits_map:
+                    hit["inner_hits"] = {"chunks": inner_hits_map[(idx, doc_id)]}
                 hits.append(hit)
             max_score = vector_results[0][3] if vector_results else None
         else:
             # Keyword only
             hits = []
             for idx, doc_id, source, score in keyword_results[from_ : from_ + size]:
-                hit = format_hit(idx, doc_id, source, score=score)
+                source = source.copy() if source else {}
+                if idx in self._table_indexes:
+                    source["_table_row_id"] = doc_id
+                hit = format_hit(idx, str(doc_id), source, score=score)
                 hits.append(hit)
             max_score = keyword_results[0][3] if keyword_results else None
 
@@ -757,7 +823,7 @@ class Elasticsearch:
         else:
             indices = None
 
-        query = {}
+        query: dict[str, Any] = {}
         if body:
             query = body.get("query", {})
 
@@ -767,12 +833,11 @@ class Elasticsearch:
         # Compile and count
         compiled = self._query_compiler.compile(query)
 
-        cursor = self._conn.cursor()
         where_parts = []
-        params = []
+        params: list[Any] = []
 
         if indices:
-            placeholders = ",".join("?" for _ in indices)
+            placeholders = self._backend.placeholders(len(indices))
             where_parts.append(f"_index IN ({placeholders})")
             params.extend(indices)
 
@@ -781,10 +846,10 @@ class Elasticsearch:
             params.extend(compiled.params)
 
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
-        sql = f"SELECT COUNT(*) FROM _documents WHERE {where_clause}"
+        sql = f"SELECT COUNT(*) as cnt FROM _documents WHERE {where_clause}"
 
-        cursor.execute(sql, params)
-        count = cursor.fetchone()[0]
+        rows = self._backend.execute(sql, params)
+        count = rows[0]["cnt"] if rows else 0
 
         return {
             "count": count,
@@ -795,73 +860,27 @@ class Elasticsearch:
     # Internal Methods
     # -------------------------------------------------------------------------
 
-    def _search_table_index(
-        self,
-        index: str,
-        body: dict[str, Any] | None,
-        q: str | None,
-        size: int,
-        from_: int,
-        mode: Literal["keyword", "semantic", "hybrid"],
-        start_time: float,
-    ) -> dict[str, Any]:
-        """Search a registered table index."""
-        table_index = self._table_indexes[index]
-
-        # Extract query text
-        query_text = q
-        if not query_text and body:
-            query = body.get("query", {})
-            query_text = self._extract_query_text(query, None)
-
-        if not query_text:
-            # No query - return empty results
-            took_ms = int((time.time() - start_time) * 1000)
-            return format_search_response([], 0, took_ms, None)
-
-        # Search the table index
-        results = table_index.search(
-            query=query_text,
-            mode=mode,
-            limit=size,
-            offset=from_,
-        )
-
-        # Format as ES response
-        hits = []
-        for result in results:
-            hit = format_hit(
-                index=index,
-                doc_id=str(result["id"]),
-                source={"_table_row_id": result["id"]},
-                score=result["score"],
-            )
-            hits.append(hit)
-
-        total = len(results)  # Note: This is the returned count, not true total
-        max_score = results[0]["score"] if results else None
-        took_ms = int((time.time() - start_time) * 1000)
-
-        return format_search_response(hits, total, took_ms, max_score)
-
     def _ensure_index(self, index: str) -> None:
         """Ensure index exists, creating if needed."""
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT 1 FROM _indices WHERE name = ?", (index,))
-        if not cursor.fetchone():
-            cursor.execute(
+        rows = self._backend.execute(
+            "SELECT 1 FROM _indices WHERE name = ?", (index,)
+        )
+        if not rows:
+            self._backend.execute(
                 "INSERT INTO _indices (name, created_at) VALUES (?, ?)",
-                (index, time.time()),
+                (index, self._backend.timestamp_now()),
             )
-            self._conn.commit()
+            self._backend.commit()
 
     def _get_index_mappings(self, index: str) -> dict | None:
         """Get mappings for an index."""
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT mappings_json FROM _indices WHERE name = ?", (index,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            return json.loads(row[0])
+        rows = self._backend.execute(
+            "SELECT mappings_json FROM _indices WHERE name = ?", (index,)
+        )
+        if rows and rows[0]["mappings_json"]:
+            data = rows[0]["mappings_json"]
+            # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+            return data if isinstance(data, dict) else json.loads(data)
         return None
 
     def _count_matches(
@@ -872,12 +891,11 @@ class Elasticsearch:
         """Count documents matching a query."""
         compiled = self._query_compiler.compile(query)
 
-        cursor = self._conn.cursor()
         where_parts = []
-        params = []
+        params: list[Any] = []
 
         if indices:
-            placeholders = ",".join("?" for _ in indices)
+            placeholders = self._backend.placeholders(len(indices))
             where_parts.append(f"_index IN ({placeholders})")
             params.extend(indices)
 
@@ -886,10 +904,19 @@ class Elasticsearch:
             params.extend(compiled.params)
 
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
-        sql = f"SELECT COUNT(*) FROM _documents WHERE {where_clause}"
 
-        cursor.execute(sql, params)
-        return cursor.fetchone()[0]
+        # Get SQL from backend (handles FTS for SQLite vs PostgreSQL)
+        sql, num_fts_params = self._backend.document_fts_count_sql(
+            where_clause, compiled.uses_fts
+        )
+
+        if compiled.uses_fts:
+            # Add FTS params at the end
+            fts_params = [compiled.fts_query] * num_fts_params
+            params = params + fts_params
+
+        rows = self._backend.execute(sql, params)
+        return rows[0]["cnt"] if rows else 0
 
     def _keyword_search(
         self,
@@ -897,15 +924,14 @@ class Elasticsearch:
         indices: list[str] | None,
         size: int,
     ) -> list[tuple[str, str, dict[str, Any], float]]:
-        """Execute keyword search using FTS5."""
+        """Execute keyword search using FTS."""
         compiled = self._query_compiler.compile(query)
 
-        cursor = self._conn.cursor()
         where_parts = []
-        params = []
+        params: list[Any] = []
 
         if indices:
-            placeholders = ",".join("?" for _ in indices)
+            placeholders = self._backend.placeholders(len(indices))
             where_parts.append(f"_index IN ({placeholders})")
             params.extend(indices)
 
@@ -915,34 +941,25 @@ class Elasticsearch:
 
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
 
-        # Use BM25 scoring if FTS query
+        # Get SQL from backend (handles SQLite vs PostgreSQL differences)
+        sql, num_fts_params = self._backend.document_fts_search_sql(
+            where_clause, compiled.uses_fts, compiled.fts_query
+        )
+
         if compiled.uses_fts:
-            sql = f"""
-                SELECT d._index, d._id, d._source,
-                       (SELECT bm25(_documents_fts) FROM _documents_fts
-                        WHERE _documents_fts.rowid = d.rowid AND _documents_fts MATCH ?) as score
-                FROM _documents d
-                WHERE {where_clause}
-                ORDER BY score
-                LIMIT ?
-            """
-            # Add FTS query for scoring
-            params = [compiled.fts_query] + params + [size]
+            # FTS params go at the beginning (1 for SQLite, 2 for PostgreSQL)
+            fts_params = [compiled.fts_query] * num_fts_params
+            params = fts_params + params + [size]
         else:
-            sql = f"""
-                SELECT _index, _id, _source, 1.0 as score
-                FROM _documents
-                WHERE {where_clause}
-                LIMIT ?
-            """
             params.append(size)
 
-        cursor.execute(sql, params)
+        rows = self._backend.execute(sql, params)
         results = []
-        for row in cursor.fetchall():
-            source = json.loads(row[2])
-            score = -row[3] if row[3] else 0.0  # BM25 returns negative scores
-            results.append((row[0], row[1], source, score))
+        for row in rows:
+            # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+            source = row["_source"] if isinstance(row["_source"], dict) else json.loads(row["_source"])
+            score = -row["score"] if row["score"] else 0.0  # BM25 returns negative
+            results.append((row["_index"], row["_id"], source, score))
 
         return results
 
@@ -953,26 +970,24 @@ class Elasticsearch:
         size: int,
     ) -> list[tuple[str, str, dict[str, Any], float]]:
         """Execute vector similarity search."""
-        if not self._embedding_backend or not self._has_vec:
+        if not self._embedding_backend or not self._backend.vector_available():
             return []
 
         # Get query embedding
         query_embedding = self._embedding_backend.embed(query_text)
         embedding_json = json.dumps(query_embedding)
 
-        cursor = self._conn.cursor()
-
         # Vector search with optional index filter
         if indices:
             # Filter by index prefix
             index_filters = " OR ".join("doc_key LIKE ?" for _ in indices)
-            index_params = [f"{idx}:%" for idx in indices]
+            index_params: list[Any] = [f"{idx}:%" for idx in indices]
 
             sql = f"""
-                SELECT v.doc_key, v.distance
-                FROM _documents_vec v
+                SELECT doc_key, distance
+                FROM _documents_vec
                 WHERE ({index_filters})
-                ORDER BY v.embedding <-> ?
+                ORDER BY embedding <-> ?
                 LIMIT ?
             """
             params = index_params + [embedding_json, size]
@@ -986,13 +1001,14 @@ class Elasticsearch:
             params = [embedding_json, size]
 
         try:
-            cursor.execute(sql, params)
-        except sqlite3.OperationalError:
+            rows = self._backend.execute(sql, params)
+        except Exception:
             return []
 
         results = []
-        for row in cursor.fetchall():
-            doc_key, distance = row
+        for row in rows:
+            doc_key = row["doc_key"]
+            distance = row["distance"]
             # Parse index:id from doc_key
             parts = doc_key.split(":", 1)
             if len(parts) != 2:
@@ -1000,14 +1016,14 @@ class Elasticsearch:
             idx, doc_id = parts
 
             # Get full document
-            cursor.execute(
+            doc_rows = self._backend.execute(
                 "SELECT _source FROM _documents WHERE _index = ? AND _id = ?",
                 (idx, doc_id),
             )
-            doc_row = cursor.fetchone()
-            if doc_row:
-                source = json.loads(doc_row[0])
-                # Convert distance to similarity score (1 - distance for cosine)
+            if doc_rows:
+                # PostgreSQL JSONB returns dict directly, SQLite returns JSON string
+                src = doc_rows[0]["_source"]
+                source = src if isinstance(src, dict) else json.loads(src)
                 score = 1.0 - float(distance)
                 results.append((idx, doc_id, source, score))
 
@@ -1015,26 +1031,15 @@ class Elasticsearch:
 
     def _update_embedding(self, index: str, doc_id: str, text: str) -> None:
         """Update vector embedding for a document."""
-        if not self._embedding_backend or not self._has_vec:
+        if not self._embedding_backend or not self._backend.vector_available():
             return
 
         try:
             embedding = self._embedding_backend.embed(text)
-            embedding_json = json.dumps(embedding)
             doc_key = f"{index}:{doc_id}"
-
-            cursor = self._conn.cursor()
-            # Upsert embedding
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO _documents_vec (doc_key, embedding)
-                VALUES (?, ?)
-                """,
-                (doc_key, embedding_json),
-            )
+            self._backend.vector_upsert("_documents_vec", doc_key, embedding)
         except Exception:
-            # Don't fail document indexing if embedding fails
-            pass
+            pass  # Don't fail document indexing if embedding fails
 
     def _extract_query_text(self, query: dict[str, Any], q: str | None) -> str | None:
         """Extract text from query for semantic search."""
